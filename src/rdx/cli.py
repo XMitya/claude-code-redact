@@ -515,6 +515,89 @@ def cmd_cat(args: argparse.Namespace) -> int:
     return 0
 
 
+# ── debug ──────────────────────────────────────────────────────────
+
+
+def cmd_debug(args: argparse.Namespace) -> int:
+    """Read and compare rdx debug body dumps."""
+    debug_dir = Path(args.dir) if args.dir else Path.cwd() / ".claude" / "rdx_debug"
+    if not debug_dir.exists():
+        print(f"No debug directory at {debug_dir}")
+        print("Start the proxy with --dangerously-log-full-bodies to generate debug files.")
+        return 1
+
+    files = sorted(debug_dir.glob("*.json"))
+    if not files:
+        print("No debug files found.")
+        return 0
+
+    # Group by request ID
+    requests: dict[str, dict[str, Path]] = {}
+    for f in files:
+        parts = f.stem.split("_")  # HHMMSS_r0001_1_original_request
+        if len(parts) >= 3:
+            req_id = parts[1]  # r0001
+            label = "_".join(parts[2:])  # 1_original_request
+            requests.setdefault(req_id, {})[label] = f
+
+    if args.list:
+        for req_id, labels in requests.items():
+            print(f"\n  {req_id}:")
+            for label, path in sorted(labels.items()):
+                size = path.stat().st_size
+                print(f"    {label:35s} {size:>8,d} bytes")
+        return 0
+
+    if args.diff:
+        # Show diff between original and redacted for a specific request
+        req_id = args.diff
+        if req_id not in requests:
+            # Try with r prefix
+            req_id = f"r{args.diff.zfill(4)}"
+        if req_id not in requests:
+            print(f"Request {args.diff} not found. Use --list to see available requests.")
+            return 1
+
+        labels = requests[req_id]
+        orig_key = next((k for k in labels if "original" in k), None)
+        red_key = next((k for k in labels if "redacted" in k and "un" not in k), None)
+
+        if not orig_key or not red_key:
+            print(f"Missing original or redacted file for {req_id}")
+            return 1
+
+        orig_text = labels[orig_key].read_text()
+        red_text = labels[red_key].read_text()
+
+        # Find differences
+        import difflib
+        orig_lines = orig_text.splitlines()
+        red_lines = red_text.splitlines()
+        diff = list(difflib.unified_diff(orig_lines, red_lines, lineterm="",
+                                          fromfile="original", tofile="redacted", n=0))
+        if not diff:
+            print(f"  {req_id}: no differences (nothing was redacted)")
+        else:
+            print(f"  {req_id}: {len([d for d in diff if d.startswith('-') and not d.startswith('---')])} lines changed")
+            for line in diff:
+                if line.startswith("-") and not line.startswith("---"):
+                    # Truncate long lines
+                    print(f"  {line[:120]}")
+                elif line.startswith("+") and not line.startswith("+++"):
+                    print(f"  {line[:120]}")
+        return 0
+
+    # Default: show summary
+    print(f"Debug directory: {debug_dir}")
+    print(f"Requests: {len(requests)}\n")
+    for req_id, labels in requests.items():
+        orig_size = next((labels[k].stat().st_size for k in labels if "original" in k), 0)
+        red_size = next((labels[k].stat().st_size for k in labels if "redacted" in k and "un" not in k), 0)
+        has_response = any("response" in k for k in labels)
+        print(f"  {req_id}: {len(labels)} files | request: {orig_size:,d}→{red_size:,d} bytes | response: {'yes' if has_response else 'no'}")
+    return 0
+
+
 # ── audit ──────────────────────────────────────────────────────────
 
 
@@ -732,6 +815,14 @@ def build_parser() -> argparse.ArgumentParser:
     cat_p.set_defaults(func=cmd_cat)
 
     # audit
+    # debug
+    debug_p = subparsers.add_parser("debug", help="Read proxy debug body dumps")
+    debug_p.add_argument("--list", action="store_true", help="List all debug files")
+    debug_p.add_argument("--diff", type=str, metavar="REQ_ID", help="Show diff between original and redacted (e.g., --diff 1)")
+    debug_p.add_argument("--dir", type=str, help="Debug directory (default: .claude/rdx_debug/)")
+    debug_p.set_defaults(func=cmd_debug)
+
+    # audit
     audit_p = subparsers.add_parser("audit", help="View audit log")
     audit_p.add_argument("--stats", action="store_true", help="Show aggregate stats")
     audit_p.add_argument("--clear", action="store_true", help="Clear the audit log")
@@ -762,7 +853,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
 
     # Catch-all: if first arg is not a known subcommand, treat as command to run
-    known = {"proxy", "setup", "init", "hook", "rewrite", "rules", "secret", "check", "cat", "audit", "discover", "shadow"}
+    known = {"proxy", "setup", "init", "hook", "rewrite", "rules", "secret", "check", "cat", "debug", "audit", "discover", "shadow"}
     if argv is None:
         argv = sys.argv[1:]
 
