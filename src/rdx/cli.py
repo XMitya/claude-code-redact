@@ -87,11 +87,15 @@ def cmd_proxy_start(args: argparse.Namespace) -> int:
 
     if getattr(args, "foreground", False):
         # Foreground mode — logging flags only work here
-        from rdx.proxy.server import enable_audit, enable_body_logging
+        from rdx.proxy.server import enable_audit, enable_body_logging, disable_unredact
         if getattr(args, "dangerously_enable_logging", False):
             enable_audit()
         if getattr(args, "dangerously_log_full_bodies", False):
             enable_body_logging()
+        if getattr(args, "no_unredact", False):
+            disable_unredact()
+            print("--no-unredact: responses will stay redacted. Use hooks for Write/Edit un-redaction.", file=sys.stderr)
+            print("Note: only format-preserving rules are un-redacted on write. Auto-tokens (__RDX_*__) pass through.", file=sys.stderr)
 
         import uvicorn
         pid_path.parent.mkdir(parents=True, exist_ok=True)
@@ -754,6 +758,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_p.add_argument("--foreground", action="store_true", help="Run in foreground (for systemd)")
     start_p.add_argument("--dangerously-enable-logging", action="store_true", help="Enable audit logging — writes redaction events to disk. NEVER use in production.")
     start_p.add_argument("--dangerously-log-full-bodies", action="store_true", help="Dump full API request/response bodies to .claude/rdx_debug/. Contains ALL secrets in plaintext.")
+    start_p.add_argument("--no-unredact", action="store_true", help="Don't un-redact responses — chat stays redacted, use with hooks for Write/Edit un-redaction")
     start_p.add_argument("--rules-dir", type=str, help="Project directory containing .redaction_rules (default: cwd)")
     start_p.set_defaults(func=cmd_proxy_start)
 

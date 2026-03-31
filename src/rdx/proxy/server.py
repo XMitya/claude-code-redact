@@ -33,12 +33,19 @@ def _get_audit_dir() -> "Path":
 _audit = AuditLogger(_get_audit_dir())
 _audit_enabled = False
 _log_bodies = False
+_no_unredact = False
 
 
 def enable_audit() -> None:
     """Called by CLI before starting foreground server."""
     global _audit_enabled
     _audit_enabled = True
+
+
+def disable_unredact() -> None:
+    """Called by CLI — responses pass through without un-redaction."""
+    global _no_unredact
+    _no_unredact = True
 
 
 def enable_body_logging() -> None:
@@ -86,17 +93,46 @@ def _get_timeout() -> float:
         return DEFAULT_TIMEOUT
 
 
-def _build_rules() -> list:
-    """Load user rules and merge with builtins.
+def _extract_project_dir(body: dict) -> "Path | None":
+    """Extract the working directory from the system prompt in the request body."""
+    import re
+    from pathlib import Path
 
-    Uses RDX_RULES_DIR env var if set, otherwise cwd.
+    system = body.get("system", [])
+    if isinstance(system, str):
+        texts = [system]
+    elif isinstance(system, list):
+        texts = [b.get("text", "") for b in system if isinstance(b, dict)]
+    else:
+        texts = []
+
+    for text in texts:
+        m = re.search(r"Primary working directory:\s*(\S+)", text)
+        if m:
+            p = Path(m.group(1))
+            if p.is_dir():
+                return p
+    return None
+
+
+def _build_rules_for_project(project_dir: "Path | None") -> list:
+    """Load user rules for a project and merge with builtins.
+
+    Returns empty list if project has no .redaction_rules.
     """
     from pathlib import Path
-    rules_dir = os.environ.get("RDX_RULES_DIR")
-    project_dir = Path(rules_dir) if rules_dir else None
+
+    if project_dir is None:
+        # Fallback to RDX_RULES_DIR or cwd
+        rules_dir = os.environ.get("RDX_RULES_DIR")
+        project_dir = Path(rules_dir) if rules_dir else Path.cwd()
+
+    rules_file = project_dir / ".redaction_rules"
+    if not rules_file.exists():
+        return []  # No rules → skip redaction entirely
+
     user_rules = load_rules(project_dir)
     builtin_rules = get_builtin_rules()
-    # User rules first so they take priority in scanning
     seen_ids = {r.id for r in user_rules}
     merged = list(user_rules)
     for r in builtin_rules:
@@ -105,13 +141,44 @@ def _build_rules() -> list:
     return merged
 
 
-# Shared mapping cache — lives for the lifetime of the server process.
-_cache = MappingCache()
+# Per-project mapping caches — keyed by project dir path.
+_caches: dict[str, MappingCache] = {}
+
+
+def _get_cache(project_dir: "Path | None") -> MappingCache:
+    key = str(project_dir) if project_dir else "__default__"
+    if key not in _caches:
+        _caches[key] = MappingCache()
+    return _caches[key]
+
+
+async def _forward_raw(request: Request, body: dict, timeout: float) -> StreamingResponse | JSONResponse:
+    """Forward request to upstream without any redaction."""
+    headers = {}
+    for key in _FORWARD_HEADERS:
+        value = request.headers.get(key)
+        if value is not None:
+            headers[key] = value
+    upstream_url = _get_upstream_url() + "/v1/messages"
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        if body.get("stream", False):
+            resp = await client.send(
+                client.build_request("POST", upstream_url, headers=headers,
+                                     content=json.dumps(body).encode()),
+                stream=True,
+            )
+            return StreamingResponse(resp.aiter_bytes(), media_type="text/event-stream",
+                                     headers={"cache-control": "no-cache"})
+        else:
+            resp = await client.post(upstream_url, headers=headers,
+                                     content=json.dumps(body).encode())
+            return JSONResponse(resp.json(), status_code=resp.status_code)
 
 
 async def health(request: Request) -> JSONResponse:
     """Health check endpoint."""
-    return JSONResponse({"status": "ok"})
+    return JSONResponse({"status": "ok", "projects": len(_caches)})
 
 
 async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
@@ -121,13 +188,22 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
     _request_counter += 1
     req_id = _request_counter
 
-    rules = _build_rules()
-    redactor = Redactor(rules, _cache)
-    unredactor = Unredactor(_cache)
     timeout = _get_timeout()
-
     body = await request.json()
     _log_body("1_original_request", body, req_id)
+
+    # Detect which project this request belongs to
+    project_dir = _extract_project_dir(body)
+    rules = _build_rules_for_project(project_dir)
+
+    if not rules:
+        # No redaction rules for this project — pass through untouched
+        print(f"[rdx] req#{req_id} no rules for {project_dir or 'unknown'} — passthrough", file=sys.stderr)
+        return await _forward_raw(request, body, timeout)
+
+    cache = _get_cache(project_dir)
+    redactor = Redactor(rules, cache)
+    unredactor = Unredactor(cache)
 
     t0 = _time.monotonic()
     try:
@@ -187,7 +263,12 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
                 )
 
             async def _logged_stream():
-                async for chunk in unredact_stream(upstream_resp, unredactor):
+                stream_src = (
+                    upstream_resp.aiter_bytes()
+                    if _no_unredact
+                    else unredact_stream(upstream_resp, unredactor)
+                )
+                async for chunk in stream_src:
                     yield chunk
                 # Log after stream completes
                 if _audit_enabled:
@@ -227,6 +308,10 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
 
             response_body = upstream_resp.json()
             _log_body("3_raw_response", response_body, req_id)
+
+            if _no_unredact:
+                return JSONResponse(response_body)
+
             t1 = _time.monotonic()
             try:
                 unredacted_body = unredact_response_body(response_body, unredactor)
