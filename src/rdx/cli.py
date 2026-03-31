@@ -81,6 +81,9 @@ def cmd_proxy_start(args: argparse.Namespace) -> int:
         except (OSError, ValueError):
             pid_path.unlink(missing_ok=True)
 
+    if getattr(args, "dangerously_enable_logging", False):
+        os.environ["RDX_DANGEROUSLY_ENABLE_LOGGING"] = "1"
+
     if getattr(args, "foreground", False):
         # Foreground mode — used by systemd and direct invocation
         import uvicorn
@@ -95,6 +98,9 @@ def cmd_proxy_start(args: argparse.Namespace) -> int:
 
     # Background mode (default)
     pid_path.parent.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    if getattr(args, "dangerously_enable_logging", False):
+        env["RDX_AUDIT"] = "1"
     proc = subprocess.Popen(
         [
             sys.executable, "-m", "uvicorn",
@@ -102,6 +108,7 @@ def cmd_proxy_start(args: argparse.Namespace) -> int:
             "--host", "127.0.0.1",
             "--port", str(port),
         ],
+        env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
@@ -629,6 +636,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_p = proxy_sub.add_parser("start", help="Start proxy server")
     start_p.add_argument("--port", type=int, default=8100, help="Port (default: 8100)")
     start_p.add_argument("--foreground", action="store_true", help="Run in foreground (for systemd)")
+    start_p.add_argument("--dangerously-enable-logging", action="store_true", help="Enable audit logging — writes redaction events to disk. NEVER use in production.")
     start_p.set_defaults(func=cmd_proxy_start)
 
     stop_p = proxy_sub.add_parser("stop", help="Stop proxy server")

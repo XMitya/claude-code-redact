@@ -26,6 +26,7 @@ from .stream import unredact_stream
 
 logger = logging.getLogger(__name__)
 _audit = AuditLogger()
+_audit_enabled = os.environ.get("RDX_DANGEROUSLY_ENABLE_LOGGING", "0") == "1"
 
 # Headers to forward from client to upstream.
 _FORWARD_HEADERS = frozenset({
@@ -88,17 +89,18 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
         logger.exception("Redaction failed on request body — passing through unredacted")
         redacted_body = body
 
-    # Log outgoing redactions
-    all_redactions = _cache.get_all_redactions()
-    if all_redactions:
-        rule_ids = list({r.rule_id for r in all_redactions})
-        _audit.log(
-            "redact", "outgoing",
-            tool="proxy",
-            rule_ids=rule_ids,
-            count=len(all_redactions),
-            detail=f"{len(all_redactions)} values redacted in API request",
-        )
+    # Log outgoing redactions (only when audit enabled)
+    if _audit_enabled:
+        all_redactions = _cache.get_all_redactions()
+        if all_redactions:
+            rule_ids = list({r.rule_id for r in all_redactions})
+            _audit.log(
+                "redact", "outgoing",
+                tool="proxy",
+                rule_ids=rule_ids,
+                count=len(all_redactions),
+                detail=f"{len(all_redactions)} values redacted in API request",
+            )
 
     is_streaming = redacted_body.get("stream", False)
 
@@ -138,14 +140,15 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
                 async for chunk in unredact_stream(upstream_resp, unredactor):
                     yield chunk
                 # Log after stream completes
-                reverse_map = _cache.get_reverse_map()
-                if reverse_map:
-                    _audit.log(
-                        "unredact", "incoming",
-                        tool="proxy",
-                        count=len(reverse_map),
-                        detail=f"{len(reverse_map)} values available for un-redaction (streaming)",
-                    )
+                if _audit_enabled:
+                    reverse_map = _cache.get_reverse_map()
+                    if reverse_map:
+                        _audit.log(
+                            "unredact", "incoming",
+                            tool="proxy",
+                            count=len(reverse_map),
+                            detail=f"{len(reverse_map)} values available for un-redaction (streaming)",
+                        )
 
             return StreamingResponse(
                 _logged_stream(),
@@ -175,14 +178,15 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
             response_body = upstream_resp.json()
             try:
                 unredacted_body = unredact_response_body(response_body, unredactor)
-                reverse_map = _cache.get_reverse_map()
-                if reverse_map:
-                    _audit.log(
-                        "unredact", "incoming",
-                        tool="proxy",
-                        count=len(reverse_map),
-                        detail=f"{len(reverse_map)} values un-redacted in API response",
-                    )
+                if _audit_enabled:
+                    reverse_map = _cache.get_reverse_map()
+                    if reverse_map:
+                        _audit.log(
+                            "unredact", "incoming",
+                            tool="proxy",
+                            count=len(reverse_map),
+                            detail=f"{len(reverse_map)} values un-redacted in API response",
+                        )
             except Exception:
                 logger.exception("Un-redaction failed on response — passing through as-is")
                 unredacted_body = response_body
