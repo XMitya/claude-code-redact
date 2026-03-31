@@ -83,6 +83,9 @@ def cmd_proxy_start(args: argparse.Namespace) -> int:
 
     if getattr(args, "dangerously_enable_logging", False):
         os.environ["RDX_DANGEROUSLY_ENABLE_LOGGING"] = "1"
+    rules_dir = getattr(args, "rules_dir", None)
+    if rules_dir:
+        os.environ["RDX_RULES_DIR"] = str(Path(rules_dir).resolve())
 
     if getattr(args, "foreground", False):
         # Foreground mode — used by systemd and direct invocation
@@ -100,7 +103,10 @@ def cmd_proxy_start(args: argparse.Namespace) -> int:
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     if getattr(args, "dangerously_enable_logging", False):
-        env["RDX_AUDIT"] = "1"
+        env["RDX_DANGEROUSLY_ENABLE_LOGGING"] = "1"
+    rules_dir = getattr(args, "rules_dir", None)
+    if rules_dir:
+        env["RDX_RULES_DIR"] = str(Path(rules_dir).resolve())
     proc = subprocess.Popen(
         [
             sys.executable, "-m", "uvicorn",
@@ -637,6 +643,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_p.add_argument("--port", type=int, default=8100, help="Port (default: 8100)")
     start_p.add_argument("--foreground", action="store_true", help="Run in foreground (for systemd)")
     start_p.add_argument("--dangerously-enable-logging", action="store_true", help="Enable audit logging — writes redaction events to disk. NEVER use in production.")
+    start_p.add_argument("--rules-dir", type=str, help="Project directory containing .redaction_rules (default: cwd)")
     start_p.set_defaults(func=cmd_proxy_start)
 
     stop_p = proxy_sub.add_parser("stop", help="Stop proxy server")

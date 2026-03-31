@@ -25,7 +25,12 @@ from .handler import redact_request_body, unredact_response_body
 from .stream import unredact_stream
 
 logger = logging.getLogger(__name__)
-_audit = AuditLogger()
+def _get_audit_dir() -> "Path":
+    from pathlib import Path
+    rules_dir = os.environ.get("RDX_RULES_DIR")
+    return Path(rules_dir) if rules_dir else Path.cwd()
+
+_audit = AuditLogger(_get_audit_dir())
 _audit_enabled = os.environ.get("RDX_DANGEROUSLY_ENABLE_LOGGING", "0") == "1"
 
 # Headers to forward from client to upstream.
@@ -53,8 +58,14 @@ def _get_timeout() -> float:
 
 
 def _build_rules() -> list:
-    """Load user rules and merge with builtins."""
-    user_rules = load_rules()
+    """Load user rules and merge with builtins.
+
+    Uses RDX_RULES_DIR env var if set, otherwise cwd.
+    """
+    from pathlib import Path
+    rules_dir = os.environ.get("RDX_RULES_DIR")
+    project_dir = Path(rules_dir) if rules_dir else None
+    user_rules = load_rules(project_dir)
     builtin_rules = get_builtin_rules()
     # User rules first so they take priority in scanning
     seen_ids = {r.id for r in user_rules}
