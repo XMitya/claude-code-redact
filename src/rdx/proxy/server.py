@@ -55,12 +55,14 @@ def enable_body_logging() -> None:
 _request_counter = 0
 
 
-def _log_body(label: str, body: dict, request_id: int) -> None:
+def _log_body(label: str, body: dict, request_id: int, project_dir: "Path | None" = None) -> None:
     """Write a full request/response body to the debug log directory."""
     if not _log_bodies:
         return
     import time
-    debug_dir = _get_audit_dir() / ".claude" / "rdx_debug"
+    from pathlib import Path
+    base = project_dir if project_dir else _get_audit_dir()
+    debug_dir = base / ".claude" / "rdx_debug"
     debug_dir.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%H%M%S")
     filename = f"{ts}_r{request_id:04d}_{label}.json"
@@ -190,10 +192,10 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
 
     timeout = _get_timeout()
     body = await request.json()
-    _log_body("1_original_request", body, req_id)
 
     # Detect which project this request belongs to
     project_dir = _extract_project_dir(body)
+    _log_body("1_original_request", body, req_id, project_dir)
     rules = _build_rules_for_project(project_dir)
 
     if not rules:
@@ -212,7 +214,7 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
         logger.exception("Redaction failed on request body — passing through unredacted")
         redacted_body = body
     redact_ms = (_time.monotonic() - t0) * 1000
-    _log_body("2_redacted_request", redacted_body, req_id)
+    _log_body("2_redacted_request", redacted_body, req_id, project_dir)
     print(f"[rdx] req#{req_id} redaction: {redact_ms:.1f}ms | {_cache.stats()['mappings']} mappings", file=sys.stderr)
 
     # Log outgoing redactions (only when audit enabled)
@@ -307,7 +309,7 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
                 )
 
             response_body = upstream_resp.json()
-            _log_body("3_raw_response", response_body, req_id)
+            _log_body("3_raw_response", response_body, req_id, project_dir)
 
             if _no_unredact:
                 return JSONResponse(response_body)
@@ -316,7 +318,7 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
             try:
                 unredacted_body = unredact_response_body(response_body, unredactor)
                 unredact_ms = (_time.monotonic() - t1) * 1000
-                _log_body("4_unredacted_response", unredacted_body, req_id)
+                _log_body("4_unredacted_response", unredacted_body, req_id, project_dir)
                 print(f"[rdx] req#{req_id} un-redaction: {unredact_ms:.1f}ms", file=sys.stderr)
                 if _audit_enabled:
                     reverse_map = _cache.get_reverse_map()
