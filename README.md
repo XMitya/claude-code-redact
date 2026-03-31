@@ -26,9 +26,30 @@ You → real values → [ redact  ] → Anthropic API (receives only redacted to
 
 ### Two Replacement Strategies
 
-**Format-preserving** (user-defined): `pablo` → `peter` — Claude reasons naturally about the value.
+**Format-preserving** (user-defined): real names → fake names — Claude reasons naturally about the value.
 
 **Auto-token** (discovered PII/secrets): `sk-secret123` → `__RDX_KEY_a1b2c3d4__` — Claude treats it as an opaque placeholder.
+
+### Person Blocks
+
+Define a person once, rdx auto-generates ~30 corporate name variants (dot-separated, underscore, camelCase, initials, truncated) with case-insensitive matching:
+
+```yaml
+rules:
+  - id: dev-lead
+    category: NAME
+    person:
+      name: 'John Smith Williams'
+      replacement: 'Jane Doe Miller'
+      nicknames: ['Johnny']
+      replacement_nicknames: ['JD']
+      usernames: ['jsmith01', 'j.smith']
+      replacement_usernames: ['jdoe01', 'j.doe']
+      emails: ['john.smith@corp.com']
+      replacement_emails: ['jane.doe@newcorp.com']
+```
+
+This catches `John Smith Williams`, `JOHN_SMITH`, `jsmith`, `j.smith`, `johnsmithwilliams`, etc. Case is preserved: `JOHN` → `JANE`, `john` → `jane`, `John` → `Jane`.
 
 ## Quick Start
 
@@ -36,56 +57,84 @@ You → real values → [ redact  ] → Anthropic API (receives only redacted to
 # Install
 uv tool install claude-code-redact
 
-# Define what to redact
+# Interactive setup
+rdx init
+
+# Or define rules manually
 cat > .redaction_rules << 'EOF'
 rules:
-  - id: my-name
-    pattern: 'Pablo Rodriguez'
-    replacement: 'Peter Smith'
+  - id: dev-lead
     category: NAME
+    person:
+      name: 'John Smith'
+      replacement: 'Jane Doe'
+      usernames: ['jsmith']
+      replacement_usernames: ['jdoe']
 
   - id: company
-    pattern: 'AcmeCorp'
-    replacement: 'WidgetInc'
+    pattern: '(?i)CorpName'
+    replacement: 'FakeCorp'
     category: PROJECT
 EOF
 
-# Proxy mode (complete coverage, recommended)
-rdx setup --proxy
-rdx proxy start
-# Claude Code now sends only redacted data to the API
+# Start the proxy
+rdx proxy start --foreground --port 8642
 
-# OR: Hooks mode (no daemon, some coverage gaps)
-rdx setup --hooks
+# In another terminal, run Claude Code
+ANTHROPIC_BASE_URL=http://localhost:8642 claude
 ```
 
-## Two Operation Modes
+## Multi-Project Support
+
+The proxy auto-detects which project each request belongs to by reading the working directory from Claude Code's system prompt. Each project uses its own `.redaction_rules` and its own mapping cache. Projects without rules pass through untouched.
+
+Run one proxy, use it across all your projects:
+
+```bash
+rdx proxy start --foreground --port 8642
+# All Claude Code sessions using ANTHROPIC_BASE_URL=http://localhost:8642
+# automatically get the right rules for their project
+```
+
+## Operation Modes
 
 ### Proxy Mode (Recommended)
 
-Intercepts all API traffic via `ANTHROPIC_BASE_URL`. Zero coverage gaps — every byte is scanned.
+Intercepts all API traffic via `ANTHROPIC_BASE_URL`. Zero coverage gaps.
 
 ```bash
-rdx proxy start              # Start on localhost:8642
-rdx proxy status             # Check status
-rdx proxy stop               # Stop
+rdx proxy start --foreground --port 8642
+rdx proxy start                          # Background mode
+rdx proxy stop
+rdx proxy status
+rdx proxy install                        # Install as systemd user service
 ```
 
-### Hooks Mode
+### Proxy + No Un-redact (Awareness Mode)
+
+Chat stays redacted so you see what Claude sees. Writes are un-redacted via hooks so files stay correct:
+
+```bash
+rdx proxy start --foreground --port 8642 --no-unredact
+rdx setup --hooks   # Required: hooks un-redact Write/Edit content
+```
+
+### Hooks Mode (Lightweight)
 
 Claude Code hooks for per-tool redaction. No daemon needed, but can't modify Read/Grep output.
 
 ```bash
-rdx setup --hooks            # Configure hooks in settings.json
+rdx setup --hooks
 ```
 
 ## Detection Layers
 
-1. **Explicit rules** — Your `.redaction_rules` file. You define what to redact and what to replace it with.
-2. **Built-in patterns** — 16 regex rules for AWS keys, GitHub tokens, OpenAI keys, JWTs, private key headers, etc.
-3. **Entropy detection** — Flags high-entropy strings (likely random secrets/tokens).
-4. **Context detection** — Finds secrets by their surroundings (`password=`, `api_key:`, `Authorization: Bearer`, etc.).
-5. **NLP discovery** *(optional)* — Microsoft Presidio catches PII you didn't think to list (names, emails, phone numbers).
+1. **Explicit rules** — Your `.redaction_rules` file with patterns and replacements
+2. **Person blocks** — Auto-expand names into ~30 corporate variants with case preservation
+3. **Built-in patterns** — 16 regex rules for AWS keys, GitHub tokens, OpenAI keys, JWTs, etc.
+4. **Entropy detection** — Flags high-entropy strings (likely random secrets)
+5. **Context detection** — Finds secrets by surroundings (`password=`, `api_key:`, `Bearer`, etc.)
+6. **NLP discovery** *(optional)* — Microsoft Presidio catches PII you didn't list (names, emails, phone numbers)
 
 ```bash
 # Install with NLP support
@@ -95,78 +144,82 @@ uv tool install "claude-code-redact[nlp]"
 ## Commands
 
 ```bash
-rdx setup --proxy              # Configure proxy mode
-rdx setup --hooks              # Configure hooks mode
-rdx proxy start/stop/status    # Manage proxy
+# Setup
+rdx init                         # Interactive setup wizard
+rdx setup --proxy                # Configure proxy mode
+rdx setup --hooks                # Configure hooks mode
 
-rdx rules edit                 # Edit rules in $EDITOR
-rdx rules validate             # Check rules syntax
-rdx rules list                 # Show all active rules
-rdx secret add --id NAME       # Add hashed secret
-rdx check FILE...              # Scan files for detectable secrets
+# Proxy
+rdx proxy start --foreground     # Start (foreground, required for debug flags)
+rdx proxy start                  # Start (background)
+rdx proxy stop / status          # Manage proxy
+rdx proxy install                # Install as systemd service
 
-rdx audit                      # Recent redaction events
-rdx audit --stats              # Summary by rule/direction
-rdx audit --show-values        # Show original ↔ redacted pairs
+# Rules
+rdx rules edit                   # Edit rules in $EDITOR
+rdx rules validate               # Check syntax
+rdx rules list                   # Show all active rules (incl. expanded person blocks)
+
+# Scanning
+rdx check FILE...                # Scan files for detectable secrets
+rdx check --json FILE...         # JSON output for tooling (VS Code extension)
+rdx cat FILE                     # Print file with redactions applied
+rdx cat -n FILE                  # With line numbers
+rdx discover [DIR]               # Scan project, suggest rules for found secrets
+
+# Secrets
+rdx secret add --id NAME         # Add hashed secret (reads from stdin)
+rdx secret list                  # List hashed secrets
+
+# Debugging (foreground only)
+rdx proxy start --foreground --dangerously-enable-logging    # Audit log
+rdx proxy start --foreground --dangerously-log-full-bodies   # Dump full API bodies
+rdx audit                        # View audit log
+rdx audit --follow               # Tail audit log in real-time
+rdx debug                        # Summarize debug body dumps
+rdx debug --diff N               # Diff original vs redacted for request #N
 ```
 
 ## Configuration
 
 ### `.redaction_rules` format
 
-Place a `.redaction_rules` file in your project root (and optionally at `~/.claude/.redaction_rules` for global rules):
-
 ```yaml
 rules:
-  # Format-preserving: Claude sees "Peter Smith" instead of the real name
-  - id: developer-name
-    pattern: 'Marco Vitale'
-    replacement: 'Peter Smith'
+  # Person block: auto-expands into ~30 variant rules
+  - id: developer
     category: NAME
-    description: Lead developer name
+    person:
+      name: 'John Smith'
+      replacement: 'Jane Doe'
+      usernames: ['jsmith']
+      replacement_usernames: ['jdoe']
+      emails: ['john@corp.com']
+      replacement_emails: ['jane@newcorp.com']
 
-  # Company name
+  # Simple pattern: case-insensitive with (?i)
   - id: company
-    pattern: 'AcmeCorp'
-    replacement: 'WidgetInc'
-    category: PROJECT
-    is_regex: false                 # Literal match, no regex
-
-  # Internal domains
-  - id: internal-domain
-    pattern: 'acmecorp\.internal'   # Regex (escape the dot)
-    replacement: 'widgetinc.test'
-    category: HOST
-
-  # Auto-token: no replacement specified → generates __RDX_KEY_<hash>__
-  - id: custom-api-token
-    pattern: 'acmetk-[a-zA-Z0-9\-]{20,}'
-    category: KEY
-    description: AcmeCorp API tokens
-
-  # Company-prefixed tokens (acme-deploy-..., acme-session-..., etc.)
-  - id: acme-keys
-    pattern: 'acme-[a-z]+-[a-zA-Z0-9]{16,}'
-    category: KEY
-
-  # Ticket IDs (use auto-token to avoid collisions between different tickets)
-  - id: project-tickets
-    pattern: 'PHOENIX-\d{3,}'
+    pattern: '(?i)CorpName'
+    replacement: 'FakeCorp'
     category: PROJECT
 
-  # Hashed secret: detect without storing plaintext in the rules file
-  - id: secret-project-name
+  # Auto-token: no replacement → __RDX_KEY_<hash>__
+  - id: api-tokens
+    pattern: 'corp-tk-[a-zA-Z0-9]{20,}'
+    category: KEY
+
+  # Hashed secret: detects without storing plaintext
+  - id: secret-project
     hashed: true
-    pattern: 'sha256-hash-of-the-secret-here'
+    pattern: 'sha256-hash-here'
     hash_extractor: '\b[A-Z][a-zA-Z]+\b'
     category: PROJECT
 
-  # Tool-specific: only applies to Bash commands
+  # Block dangerous commands (hooks mode)
   - id: block-no-verify
     pattern: '--no-verify'
     action: block
     tool: Bash
-    description: Prevent bypassing git hooks
 ```
 
 ### Rule fields
@@ -174,43 +227,52 @@ rules:
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `id` | Yes | — | Unique identifier |
-| `pattern` | Yes* | — | Regex or literal string to match |
+| `pattern` | Yes* | — | Regex or literal string. Use `(?i)` for case-insensitive |
+| `person` | — | — | Person block (auto-expands, replaces `pattern`) |
 | `replacement` | No | auto-token | Format-preserving value, or omit for `__RDX_*__` |
 | `category` | No | `CUSTOM` | `NAME`, `EMAIL`, `KEY`, `IP`, `HOST`, `PROJECT`, `PATH`, `CUSTOM` |
 | `action` | No | `redact` | `redact`, `block`, or `warn` |
 | `is_regex` | No | `true` | Set `false` for literal string matching |
 | `target` | No | `both` | `llm`, `tool`, or `both` |
 | `tool` | No | all | Restrict to a specific tool (`Bash`, `Read`, etc.) |
-| `description` | No | — | Human-readable description |
-| `hashed` | No | `false` | Match by SHA-256 hash (don't store plaintext) |
-| `hash_extractor` | No | — | Regex to extract candidates for hash comparison |
-| `path_pattern` | No | — | File path glob (e.g., `*.env`, `**/secrets/*`) |
-
-### Environment variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `RDX_UPSTREAM_URL` | `https://api.anthropic.com` | Upstream API for proxy mode |
-| `RDX_PORT` | `8642` | Proxy listen port |
-| `ANTHROPIC_BASE_URL` | — | Set to `http://localhost:8642` when using proxy mode |
 
 ## Security Model
 
-- **No mapping file on disk.** The reverse map (token → original) exists only in proxy process memory. Nothing to steal.
-- **Deterministic tokens.** Same input always produces the same token (SHA-256 based). Claude's memory stays coherent across sessions.
-- **Defense against exfiltration.** Even if a prompt injection succeeds, the exfiltrated data is redacted tokens — not real secrets.
+- **Zero logging by default.** Audit and body logging require explicit `--dangerously-*` flags in foreground mode only. No env vars.
+- **No mapping file on disk.** The reverse map exists only in proxy process memory. Nothing to steal.
+- **Per-project isolation.** Different projects get separate mapping caches. No cross-contamination.
+- **Deterministic tokens.** Same input always produces the same token (SHA-256). Claude's memory stays coherent across sessions.
+- **Case preservation.** `JOHN` → `JANE`, `john` → `jane`, `John` → `Jane` — no accidental case leaks.
+- **Defense against exfiltration.** Even if a prompt injection succeeds, exfiltrated data is redacted tokens.
 
 ## How Claude Knows About Redaction
 
 `rdx setup` generates an `RDX.md` file appended to your project's `CLAUDE.md`. This tells Claude that redaction is active, shows examples of what redacted values look like, and instructs it to treat them as opaque identifiers.
 
+## VS Code Extension
+
+The `vscode-extension/` directory contains an extension that shows redacted values inline:
+
+- Red highlights on secrets with faded text showing what Claude sees
+- Toggle Claude's View (`Ctrl+Shift+R`) for side-by-side comparison
+- Hover cards with rule details
+- Status bar with redaction count
+- Problems panel integration
+
+```bash
+cd vscode-extension && npm install && npm run compile
+# Then install via VS Code: Developer → Install Extension from Location
+```
+
+Requires `rdx` in PATH (`uv tool install claude-code-redact`).
+
 ## Status
 
-Core engine, proxy server, hooks mode, CLI, audit log, RDX.md generation, init wizard, and discover command are implemented with 466 tests passing.
+Core engine, proxy server, hooks mode, CLI, audit log, RDX.md generation, init wizard, discover command, VS Code extension, person block expansion, case preservation, multi-project support, and debug tooling are implemented with 487+ tests passing.
 
 ## Acknowledgments
 
-This project was inspired by and based on [claude-code-redaction-hooks](https://github.com/l-mb/claude-code-redaction-hooks) by Lars Marowsky-Bree — a Claude Code hook-based approach to secret redaction that identified the core limitations in the hook API (PostToolUse can't modify output, UserPromptSubmit can't modify prompts). `claude-code-redact` extends that work with an API proxy architecture for complete coverage, format-preserving replacements, multi-layer detection (including Microsoft Presidio NLP), and round-trip un-redaction.
+Inspired by [claude-code-redaction-hooks](https://github.com/l-mb/claude-code-redaction-hooks) by Lars Marowsky-Bree — a Claude Code hook-based approach that identified the core limitations in the hook API. `claude-code-redact` extends that work with an API proxy architecture, format-preserving replacements, multi-layer detection (including Microsoft Presidio NLP), person block expansion, and round-trip un-redaction.
 
 ## License
 
