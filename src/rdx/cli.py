@@ -518,6 +518,27 @@ def cmd_cat(args: argparse.Namespace) -> int:
 # ── debug ──────────────────────────────────────────────────────────
 
 
+def _diff_json(
+    orig: object, red: object, path: str = ""
+) -> list[tuple[str, str, str]]:
+    """Recursively find string values that differ between two JSON structures.
+
+    Returns list of (json_path, original_value, redacted_value).
+    """
+    diffs: list[tuple[str, str, str]] = []
+    if isinstance(orig, dict) and isinstance(red, dict):
+        for key in orig:
+            if key in red:
+                diffs.extend(_diff_json(orig[key], red[key], f"{path}.{key}" if path else key))
+    elif isinstance(orig, list) and isinstance(red, list):
+        for i, (o, r) in enumerate(zip(orig, red)):
+            diffs.extend(_diff_json(o, r, f"{path}[{i}]"))
+    elif isinstance(orig, str) and isinstance(red, str):
+        if orig != red:
+            diffs.append((path, orig, red))
+    return diffs
+
+
 def cmd_debug(args: argparse.Namespace) -> int:
     """Read and compare rdx debug body dumps."""
     debug_dir = Path(args.dir) if args.dir else Path.cwd() / ".claude" / "rdx_debug"
@@ -566,25 +587,26 @@ def cmd_debug(args: argparse.Namespace) -> int:
             print(f"Missing original or redacted file for {req_id}")
             return 1
 
-        orig_text = labels[orig_key].read_text()
-        red_text = labels[red_key].read_text()
+        orig = json.loads(labels[orig_key].read_text())
+        red = json.loads(labels[red_key].read_text())
 
-        # Find differences
-        import difflib
-        orig_lines = orig_text.splitlines()
-        red_lines = red_text.splitlines()
-        diff = list(difflib.unified_diff(orig_lines, red_lines, lineterm="",
-                                          fromfile="original", tofile="redacted", n=0))
-        if not diff:
+        # Walk the JSON and find all string values that differ
+        diffs = _diff_json(orig, red)
+        if not diffs:
             print(f"  {req_id}: no differences (nothing was redacted)")
         else:
-            print(f"  {req_id}: {len([d for d in diff if d.startswith('-') and not d.startswith('---')])} lines changed")
-            for line in diff:
-                if line.startswith("-") and not line.startswith("---"):
-                    # Truncate long lines
-                    print(f"  {line[:120]}")
-                elif line.startswith("+") and not line.startswith("+++"):
-                    print(f"  {line[:120]}")
+            print(f"  {req_id}: {len(diffs)} value(s) changed\n")
+            for path, orig_val, red_val in diffs:
+                print(f"  [{path}]")
+                # Unescape \n and show line-by-line diff
+                orig_lines = orig_val.replace("\\n", "\n").splitlines()
+                red_lines = red_val.replace("\\n", "\n").splitlines()
+                for i, (o, r) in enumerate(zip(orig_lines, red_lines)):
+                    if o != r:
+                        print(f"    L{i + 1}:")
+                        print(f"      - {o[:150]}")
+                        print(f"      + {r[:150]}")
+                print()
         return 0
 
     # Default: show summary
