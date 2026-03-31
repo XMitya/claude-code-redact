@@ -81,14 +81,18 @@ def cmd_proxy_start(args: argparse.Namespace) -> int:
         except (OSError, ValueError):
             pid_path.unlink(missing_ok=True)
 
-    if getattr(args, "dangerously_enable_logging", False):
-        os.environ["RDX_DANGEROUSLY_ENABLE_LOGGING"] = "1"
     rules_dir = getattr(args, "rules_dir", None)
     if rules_dir:
         os.environ["RDX_RULES_DIR"] = str(Path(rules_dir).resolve())
 
     if getattr(args, "foreground", False):
-        # Foreground mode — used by systemd and direct invocation
+        # Foreground mode — logging flags only work here
+        from rdx.proxy.server import enable_audit, enable_body_logging
+        if getattr(args, "dangerously_enable_logging", False):
+            enable_audit()
+        if getattr(args, "dangerously_log_full_bodies", False):
+            enable_body_logging()
+
         import uvicorn
         pid_path.parent.mkdir(parents=True, exist_ok=True)
         pid_path.write_text(str(os.getpid()))
@@ -99,12 +103,13 @@ def cmd_proxy_start(args: argparse.Namespace) -> int:
             pid_path.unlink(missing_ok=True)
         return 0
 
-    # Background mode (default)
+    # Background mode — no logging, no env vars
+    if getattr(args, "dangerously_enable_logging", False) or getattr(args, "dangerously_log_full_bodies", False):
+        print("Logging flags require --foreground mode.", file=sys.stderr)
+        return 1
+
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
-    if getattr(args, "dangerously_enable_logging", False):
-        env["RDX_DANGEROUSLY_ENABLE_LOGGING"] = "1"
-    rules_dir = getattr(args, "rules_dir", None)
     if rules_dir:
         env["RDX_RULES_DIR"] = str(Path(rules_dir).resolve())
     proc = subprocess.Popen(
@@ -643,6 +648,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_p.add_argument("--port", type=int, default=8100, help="Port (default: 8100)")
     start_p.add_argument("--foreground", action="store_true", help="Run in foreground (for systemd)")
     start_p.add_argument("--dangerously-enable-logging", action="store_true", help="Enable audit logging — writes redaction events to disk. NEVER use in production.")
+    start_p.add_argument("--dangerously-log-full-bodies", action="store_true", help="Dump full API request/response bodies to .claude/rdx_debug/. Contains ALL secrets in plaintext.")
     start_p.add_argument("--rules-dir", type=str, help="Project directory containing .redaction_rules (default: cwd)")
     start_p.set_defaults(func=cmd_proxy_start)
 

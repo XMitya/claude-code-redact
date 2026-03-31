@@ -31,7 +31,36 @@ def _get_audit_dir() -> "Path":
     return Path(rules_dir) if rules_dir else Path.cwd()
 
 _audit = AuditLogger(_get_audit_dir())
-_audit_enabled = os.environ.get("RDX_DANGEROUSLY_ENABLE_LOGGING", "0") == "1"
+_audit_enabled = False
+_log_bodies = False
+
+
+def enable_audit() -> None:
+    """Called by CLI before starting foreground server."""
+    global _audit_enabled
+    _audit_enabled = True
+
+
+def enable_body_logging() -> None:
+    """Called by CLI before starting foreground server."""
+    global _log_bodies
+    _log_bodies = True
+_request_counter = 0
+
+
+def _log_body(label: str, body: dict, request_id: int) -> None:
+    """Write a full request/response body to the debug log directory."""
+    if not _log_bodies:
+        return
+    import time
+    debug_dir = _get_audit_dir() / ".claude" / "rdx_debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%H%M%S")
+    filename = f"{ts}_r{request_id:04d}_{label}.json"
+    path = debug_dir / filename
+    with open(path, "w") as f:
+        json.dump(body, f, indent=2, default=str)
+    print(f"[rdx] {label} → {path}", file=sys.stderr)
 
 # Headers to forward from client to upstream.
 _FORWARD_HEADERS = frozenset({
@@ -87,18 +116,28 @@ async def health(request: Request) -> JSONResponse:
 
 async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
     """Proxy POST /v1/messages — redact outgoing, un-redact incoming."""
+    import time as _time
+    global _request_counter
+    _request_counter += 1
+    req_id = _request_counter
+
     rules = _build_rules()
     redactor = Redactor(rules, _cache)
     unredactor = Unredactor(_cache)
     timeout = _get_timeout()
 
     body = await request.json()
+    _log_body("1_original_request", body, req_id)
 
+    t0 = _time.monotonic()
     try:
         redacted_body = redact_request_body(body, redactor)
     except Exception:
         logger.exception("Redaction failed on request body — passing through unredacted")
         redacted_body = body
+    redact_ms = (_time.monotonic() - t0) * 1000
+    _log_body("2_redacted_request", redacted_body, req_id)
+    print(f"[rdx] req#{req_id} redaction: {redact_ms:.1f}ms | {_cache.stats()['mappings']} mappings", file=sys.stderr)
 
     # Log outgoing redactions (only when audit enabled)
     if _audit_enabled:
@@ -187,8 +226,13 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
                 )
 
             response_body = upstream_resp.json()
+            _log_body("3_raw_response", response_body, req_id)
+            t1 = _time.monotonic()
             try:
                 unredacted_body = unredact_response_body(response_body, unredactor)
+                unredact_ms = (_time.monotonic() - t1) * 1000
+                _log_body("4_unredacted_response", unredacted_body, req_id)
+                print(f"[rdx] req#{req_id} un-redaction: {unredact_ms:.1f}ms", file=sys.stderr)
                 if _audit_enabled:
                     reverse_map = _cache.get_reverse_map()
                     if reverse_map:
