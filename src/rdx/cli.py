@@ -1,20 +1,20 @@
 """Full CLI entry point for rdx.
 
 Usage:
-    rdx proxy start [--port PORT]
-    rdx proxy stop
-    rdx proxy status
-    rdx setup --proxy | --hooks | --show
+    rdx setup --proxy [--foreground] [--port N] [--no-unredact]
+    rdx setup --hooks [--global]
+    rdx setup --off
+    rdx setup --show
+    rdx init                        (interactive setup wizard)
     rdx hook                        (reads JSON from stdin)
-    rdx rewrite COMMAND             (un-redact + rewrite for rdx proxy)
-    rdx rules edit [--global]
-    rdx rules validate [--global]
-    rdx rules list [--global]
-    rdx secret add --id ID [--global]
-    rdx secret list [--global]
-    rdx check FILE... | --stdin
-    rdx audit [--stats] [--show-values] [--tail N]
-    rdx shadow clean
+    rdx rewrite COMMAND
+    rdx rules edit|validate|list
+    rdx secret add|list
+    rdx check FILE... [--json]
+    rdx cat FILE [-n]
+    rdx discover [DIR]
+    rdx audit [--follow] [--stats]
+    rdx debug [--list] [--diff N]
     rdx <anything-else>             (catch-all: execute with output redaction)
 """
 
@@ -43,7 +43,7 @@ from rdx.core.scanner import hash_text
 from rdx.core.unredactor import Unredactor
 from rdx.detect.patterns import get_builtin_rules
 
-PID_FILE = ".claude/rdx_proxy.pid"
+DEFAULT_PROXY_PORT = 8642
 
 
 # ── Helpers ────────────────────────────────────────────────────────
@@ -53,10 +53,6 @@ def _project_dir() -> Path:
     return Path.cwd()
 
 
-def _pid_path() -> Path:
-    return _project_dir() / PID_FILE
-
-
 def _build_rules() -> list:
     rules = load_rules()
     rules.extend(get_builtin_rules())
@@ -64,73 +60,6 @@ def _build_rules() -> list:
 
 
 # ── proxy ──────────────────────────────────────────────────────────
-
-
-def cmd_proxy_start(args: argparse.Namespace) -> int:
-    """Start the redaction proxy server."""
-    port = args.port
-    pid_path = _pid_path()
-
-    # Check if already running
-    if pid_path.exists():
-        try:
-            pid = int(pid_path.read_text().strip())
-            os.kill(pid, 0)
-            print(f"Proxy already running (pid {pid})")
-            return 1
-        except (OSError, ValueError):
-            pid_path.unlink(missing_ok=True)
-
-    rules_dir = getattr(args, "rules_dir", None)
-    if rules_dir:
-        os.environ["RDX_RULES_DIR"] = str(Path(rules_dir).resolve())
-
-    if getattr(args, "foreground", False):
-        # Foreground mode — logging flags only work here
-        from rdx.proxy.server import enable_audit, enable_body_logging, disable_unredact
-        if getattr(args, "dangerously_enable_logging", False):
-            enable_audit()
-        if getattr(args, "dangerously_log_full_bodies", False):
-            enable_body_logging()
-        if getattr(args, "no_unredact", False):
-            disable_unredact()
-            print("--no-unredact: responses will stay redacted. Use hooks for Write/Edit un-redaction.", file=sys.stderr)
-            print("Note: only format-preserving rules are un-redacted on write. Auto-tokens (__RDX_*__) pass through.", file=sys.stderr)
-
-        import uvicorn
-        pid_path.parent.mkdir(parents=True, exist_ok=True)
-        pid_path.write_text(str(os.getpid()))
-        print(f"Proxy starting on http://127.0.0.1:{port} (pid {os.getpid()})")
-        try:
-            uvicorn.run("rdx.proxy.server:app", host="127.0.0.1", port=port, log_level="warning")
-        finally:
-            pid_path.unlink(missing_ok=True)
-        return 0
-
-    # Background mode — no logging, no env vars
-    if getattr(args, "dangerously_enable_logging", False) or getattr(args, "dangerously_log_full_bodies", False):
-        print("Logging flags require --foreground mode.", file=sys.stderr)
-        return 1
-
-    pid_path.parent.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ)
-    if rules_dir:
-        env["RDX_RULES_DIR"] = str(Path(rules_dir).resolve())
-    proc = subprocess.Popen(
-        [
-            sys.executable, "-m", "uvicorn",
-            "rdx.proxy.server:app",
-            "--host", "127.0.0.1",
-            "--port", str(port),
-        ],
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    pid_path.write_text(str(proc.pid))
-    print(f"Proxy started on http://127.0.0.1:{port} (pid {proc.pid})")
-    return 0
 
 
 def cmd_proxy_install_systemd(args: argparse.Namespace) -> int:
@@ -172,41 +101,6 @@ WantedBy=default.target
     return 0
 
 
-def cmd_proxy_stop(args: argparse.Namespace) -> int:
-    """Stop the redaction proxy server."""
-    pid_path = _pid_path()
-    if not pid_path.exists():
-        print("Proxy not running")
-        return 1
-
-    try:
-        pid = int(pid_path.read_text().strip())
-        os.kill(pid, signal.SIGTERM)
-        print(f"Proxy stopped (pid {pid})")
-    except (OSError, ValueError) as e:
-        print(f"Could not stop proxy: {e}")
-    finally:
-        pid_path.unlink(missing_ok=True)
-    return 0
-
-
-def cmd_proxy_status(args: argparse.Namespace) -> int:
-    """Show proxy server status."""
-    pid_path = _pid_path()
-    if not pid_path.exists():
-        print("Proxy: not running")
-        return 0
-
-    try:
-        pid = int(pid_path.read_text().strip())
-        os.kill(pid, 0)
-        print(f"Proxy: running (pid {pid})")
-    except (OSError, ValueError):
-        print("Proxy: not running (stale pid file)")
-        pid_path.unlink(missing_ok=True)
-    return 0
-
-
 # ── init ───────────────────────────────────────────────────────────
 
 
@@ -223,45 +117,42 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
-    """Configure Claude Code integration."""
-    if args.show:
-        _show_setup()
+    """Configure Claude Code integration — single entry point."""
+    from rdx.setup.setup import setup_proxy, setup_hooks, setup_off, show_config
+
+    project_dir = _project_dir()
+
+    if getattr(args, "show", False):
+        config = show_config(project_dir)
+        for k, v in config.items():
+            print(f"  {k:25s} {v}")
         return 0
-    if args.proxy:
-        return _setup_proxy()
-    if args.hooks:
-        return _setup_hooks()
-    print("Specify --proxy, --hooks, or --show")
+
+    if getattr(args, "off", False):
+        setup_off(project_dir)
+        return 0
+
+    if getattr(args, "proxy", False):
+        setup_proxy(
+            project_dir,
+            port=getattr(args, "port", DEFAULT_PROXY_PORT),
+            no_unredact=getattr(args, "no_unredact", False),
+            foreground=getattr(args, "foreground", False),
+            enable_logging=getattr(args, "dangerously_enable_logging", False),
+            log_bodies=getattr(args, "dangerously_log_full_bodies", False),
+        )
+        return 0
+
+    if getattr(args, "hooks", False):
+        setup_hooks(project_dir, global_scope=getattr(args, "global_", False))
+        return 0
+
+    print("Specify --proxy, --hooks, --off, or --show")
     return 1
 
 
-def _show_setup() -> None:
-    """Display current configuration."""
-    rules_path = get_rules_path()
-    print(f"Project rules: {rules_path} ({'exists' if rules_path.exists() else 'not found'})")
-    global_path = get_rules_path(global_=True)
-    print(f"Global rules:  {global_path} ({'exists' if global_path.exists() else 'not found'})")
-    pid_path = _pid_path()
-    if pid_path.exists():
-        try:
-            pid = int(pid_path.read_text().strip())
-            os.kill(pid, 0)
-            print(f"Proxy:         running (pid {pid})")
-        except (OSError, ValueError):
-            print("Proxy:         not running")
-    else:
-        print("Proxy:         not running")
-
-
-def _setup_proxy() -> int:
-    """Set up proxy mode configuration."""
-    print("Proxy setup: set ANTHROPIC_BASE_URL=http://127.0.0.1:8100")
-    print("Then run: rdx proxy start")
-    return 0
-
-
 def _setup_hooks() -> int:
-    """Set up hooks mode configuration."""
+    """Called by init wizard."""
     print("Hooks setup: add to .claude/settings.json:")
     print(json.dumps({
         "hooks": {
@@ -749,39 +640,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command")
 
-    # proxy
-    proxy_parser = subparsers.add_parser("proxy", help="Manage the proxy server")
-    proxy_sub = proxy_parser.add_subparsers(dest="proxy_command")
-
-    start_p = proxy_sub.add_parser("start", help="Start proxy server")
-    start_p.add_argument("--port", type=int, default=8100, help="Port (default: 8100)")
-    start_p.add_argument("--foreground", action="store_true", help="Run in foreground (for systemd)")
-    start_p.add_argument("--dangerously-enable-logging", action="store_true", help="Enable audit logging — writes redaction events to disk. NEVER use in production.")
-    start_p.add_argument("--dangerously-log-full-bodies", action="store_true", help="Dump full API request/response bodies to .claude/rdx_debug/. Contains ALL secrets in plaintext.")
-    start_p.add_argument("--no-unredact", action="store_true", help="Don't un-redact responses — chat stays redacted, use with hooks for Write/Edit un-redaction")
-    start_p.add_argument("--rules-dir", type=str, help="Project directory containing .redaction_rules (default: cwd)")
-    start_p.set_defaults(func=cmd_proxy_start)
-
-    stop_p = proxy_sub.add_parser("stop", help="Stop proxy server")
-    stop_p.set_defaults(func=cmd_proxy_stop)
-
-    status_p = proxy_sub.add_parser("status", help="Show proxy status")
-    status_p.set_defaults(func=cmd_proxy_status)
-
-    install_p = proxy_sub.add_parser("install", help="Install as systemd user service")
-    install_p.add_argument("--port", type=int, default=8100, help="Port (default: 8100)")
-    install_p.set_defaults(func=cmd_proxy_install_systemd)
-
     # init
     init_p = subparsers.add_parser("init", help="Interactive setup wizard")
     init_p.add_argument("--non-interactive", action="store_true", help="Read JSON config from stdin")
     init_p.set_defaults(func=cmd_init)
 
-    # setup
-    setup_p = subparsers.add_parser("setup", help="Configure Claude Code integration")
-    setup_p.add_argument("--proxy", action="store_true", help="Set up proxy mode")
-    setup_p.add_argument("--hooks", action="store_true", help="Set up hooks mode")
-    setup_p.add_argument("--show", action="store_true", help="Show current configuration")
+    # setup — single entry point for all configuration
+    setup_p = subparsers.add_parser("setup", help="Configure rdx mode (proxy/hooks/off)")
+    mode_group = setup_p.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument("--proxy", action="store_true", help="Proxy mode: intercept all API traffic")
+    mode_group.add_argument("--hooks", action="store_true", help="Hooks mode: per-tool redaction")
+    mode_group.add_argument("--off", action="store_true", help="Disable rdx (keep deny permissions)")
+    mode_group.add_argument("--show", action="store_true", help="Show current configuration")
+    # Proxy options
+    setup_p.add_argument("--port", type=int, default=8642, help="Proxy port (default: 8642)")
+    setup_p.add_argument("--foreground", action="store_true", help="Run proxy in foreground")
+    setup_p.add_argument("--no-unredact", action="store_true", help="Chat stays redacted, Write/Edit hooks un-redact files")
+    setup_p.add_argument("--dangerously-enable-logging", action="store_true", help="Enable audit logging (foreground only)")
+    setup_p.add_argument("--dangerously-log-full-bodies", action="store_true", help="Dump full API bodies (foreground only)")
+    # Hooks options
+    setup_p.add_argument("--global", dest="global_", action="store_true", help="Configure hooks globally")
     setup_p.set_defaults(func=cmd_setup)
 
     # hook
@@ -880,7 +758,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
 
     # Catch-all: if first arg is not a known subcommand, treat as command to run
-    known = {"proxy", "setup", "init", "hook", "rewrite", "rules", "secret", "check", "cat", "debug", "audit", "discover", "shadow"}
+    known = {"setup", "init", "hook", "rewrite", "rules", "secret", "check", "cat", "debug", "audit", "discover", "shadow"}
     if argv is None:
         argv = sys.argv[1:]
 

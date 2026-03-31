@@ -77,8 +77,8 @@ rules:
     category: PROJECT
 EOF
 
-# Start the proxy
-rdx proxy start --foreground --port 8642
+# Start proxy mode
+rdx setup --proxy --foreground --port 8642
 
 # In another terminal, run Claude Code
 ANTHROPIC_BASE_URL=http://localhost:8642 claude
@@ -88,43 +88,43 @@ ANTHROPIC_BASE_URL=http://localhost:8642 claude
 
 The proxy auto-detects which project each request belongs to by reading the working directory from Claude Code's system prompt. Each project uses its own `.redaction_rules` and its own mapping cache. Projects without rules pass through untouched.
 
-Run one proxy, use it across all your projects:
-
 ```bash
-rdx proxy start --foreground --port 8642
+rdx setup --proxy --port 8642
 # All Claude Code sessions using ANTHROPIC_BASE_URL=http://localhost:8642
 # automatically get the right rules for their project
 ```
 
 ## Operation Modes
 
+`rdx setup` is the single entry point. Each mode cleans up the previous one — no stale hooks or proxy processes.
+
 ### Proxy Mode (Recommended)
 
 Intercepts all API traffic via `ANTHROPIC_BASE_URL`. Zero coverage gaps.
 
 ```bash
-rdx proxy start --foreground --port 8642
-rdx proxy start                          # Background mode
-rdx proxy stop
-rdx proxy status
-rdx proxy install                        # Install as systemd user service
+rdx setup --proxy                        # Background proxy on :8642
+rdx setup --proxy --foreground           # Foreground (for debugging)
+rdx setup --proxy --port 9000            # Custom port
+rdx setup --show                         # Check current mode
+rdx setup --off                          # Stop proxy, remove hooks
 ```
 
-### Proxy + No Un-redact (Awareness Mode)
+### Awareness Mode (Proxy + No Un-redact)
 
-Chat stays redacted so you see what Claude sees. Writes are un-redacted via hooks so files stay correct:
+Chat stays redacted so you see what Claude sees. Write/Edit hooks automatically configured to un-redact files:
 
 ```bash
-rdx proxy start --foreground --port 8642 --no-unredact
-rdx setup --hooks   # Required: hooks un-redact Write/Edit content
+rdx setup --proxy --no-unredact --foreground
 ```
 
 ### Hooks Mode (Lightweight)
 
-Claude Code hooks for per-tool redaction. No daemon needed, but can't modify Read/Grep output.
+Claude Code hooks for per-tool redaction. No daemon, but can't modify Read/Grep output.
 
 ```bash
 rdx setup --hooks
+rdx setup --hooks --global               # Global hooks
 ```
 
 ## Detection Layers
@@ -144,40 +144,37 @@ uv tool install "claude-code-redact[nlp]"
 ## Commands
 
 ```bash
-# Setup
-rdx init                         # Interactive setup wizard
-rdx setup --proxy                # Configure proxy mode
-rdx setup --hooks                # Configure hooks mode
-
-# Proxy
-rdx proxy start --foreground     # Start (foreground, required for debug flags)
-rdx proxy start                  # Start (background)
-rdx proxy stop / status          # Manage proxy
-rdx proxy install                # Install as systemd service
+# Setup (single entry point — cleans up previous mode automatically)
+rdx setup --proxy                        # Proxy mode (background)
+rdx setup --proxy --foreground           # Proxy mode (foreground)
+rdx setup --proxy --no-unredact          # Awareness mode (chat stays redacted)
+rdx setup --hooks                        # Hooks mode
+rdx setup --off                          # Disable rdx
+rdx setup --show                         # Show current mode
+rdx init                                 # Interactive wizard
 
 # Rules
-rdx rules edit                   # Edit rules in $EDITOR
-rdx rules validate               # Check syntax
-rdx rules list                   # Show all active rules (incl. expanded person blocks)
+rdx rules edit                           # Edit in $EDITOR
+rdx rules validate                       # Check syntax
+rdx rules list                           # Show all (incl. expanded person blocks)
 
 # Scanning
-rdx check FILE...                # Scan files for detectable secrets
-rdx check --json FILE...         # JSON output for tooling (VS Code extension)
-rdx cat FILE                     # Print file with redactions applied
-rdx cat -n FILE                  # With line numbers
-rdx discover [DIR]               # Scan project, suggest rules for found secrets
+rdx check FILE...                        # Scan files for secrets
+rdx check --json FILE...                 # JSON output (VS Code extension)
+rdx cat FILE [-n]                        # Print file with redactions applied
+rdx discover [DIR]                       # Scan project, suggest rules
 
 # Secrets
-rdx secret add --id NAME         # Add hashed secret (reads from stdin)
-rdx secret list                  # List hashed secrets
+rdx secret add --id NAME                 # Add hashed secret
+rdx secret list                          # List hashed secrets
 
-# Debugging (foreground only)
-rdx proxy start --foreground --dangerously-enable-logging    # Audit log
-rdx proxy start --foreground --dangerously-log-full-bodies   # Dump full API bodies
-rdx audit                        # View audit log
-rdx audit --follow               # Tail audit log in real-time
-rdx debug                        # Summarize debug body dumps
-rdx debug --diff N               # Diff original vs redacted for request #N
+# Debugging (foreground proxy only)
+rdx setup --proxy --foreground --dangerously-enable-logging
+rdx setup --proxy --foreground --dangerously-log-full-bodies
+rdx audit                                # View audit log
+rdx audit --follow                       # Tail in real-time
+rdx debug                                # Summarize debug body dumps
+rdx debug --diff N                       # Diff original vs redacted
 ```
 
 ## Configuration
