@@ -14,6 +14,23 @@ from rdx.detect.context import scan_context
 from rdx.detect.entropy import scan_entropy
 from rdx.detect.presidio import scan_presidio
 
+
+def _match_case(original: str, replacement: str) -> str:
+    """Adjust replacement to match the case style of the original.
+
+    - ALL UPPER → ALL UPPER
+    - all lower → all lower
+    - Title Case → Title Case
+    - Otherwise → replacement as-is
+    """
+    if original.isupper():
+        return replacement.upper()
+    if original.islower():
+        return replacement.lower()
+    if original.istitle():
+        return replacement.title()
+    return replacement
+
 logger = logging.getLogger(__name__)
 
 # Threshold above which we log a performance warning (1 MB).
@@ -106,6 +123,8 @@ class Redactor:
                 match.rule.category,
                 match.rule.replacement,
             )
+            # Preserve case style of the original text
+            replacement = _match_case(match.text, replacement)
             result = result[:match.start] + replacement + result[match.end:]
 
         return ScanResult(
