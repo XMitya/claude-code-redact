@@ -67,7 +67,7 @@ def _build_rules() -> list:
 
 
 def cmd_proxy_start(args: argparse.Namespace) -> int:
-    """Start the redaction proxy server in the background."""
+    """Start the redaction proxy server."""
     port = args.port
     pid_path = _pid_path()
 
@@ -75,12 +75,25 @@ def cmd_proxy_start(args: argparse.Namespace) -> int:
     if pid_path.exists():
         try:
             pid = int(pid_path.read_text().strip())
-            os.kill(pid, 0)  # Check if process exists
+            os.kill(pid, 0)
             print(f"Proxy already running (pid {pid})")
             return 1
         except (OSError, ValueError):
             pid_path.unlink(missing_ok=True)
 
+    if getattr(args, "foreground", False):
+        # Foreground mode — used by systemd and direct invocation
+        import uvicorn
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text(str(os.getpid()))
+        print(f"Proxy starting on http://127.0.0.1:{port} (pid {os.getpid()})")
+        try:
+            uvicorn.run("rdx.proxy.server:app", host="127.0.0.1", port=port, log_level="warning")
+        finally:
+            pid_path.unlink(missing_ok=True)
+        return 0
+
+    # Background mode (default)
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     proc = subprocess.Popen(
         [
@@ -95,6 +108,45 @@ def cmd_proxy_start(args: argparse.Namespace) -> int:
     )
     pid_path.write_text(str(proc.pid))
     print(f"Proxy started on http://127.0.0.1:{port} (pid {proc.pid})")
+    return 0
+
+
+def cmd_proxy_install_systemd(args: argparse.Namespace) -> int:
+    """Install rdx proxy as a systemd user service."""
+    port = args.port
+    rdx_path = subprocess.run(
+        ["which", "rdx"], capture_output=True, text=True
+    ).stdout.strip() or str(Path.home() / ".local/bin/rdx")
+
+    service_content = f"""[Unit]
+Description=RDX Redaction Proxy
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={rdx_path} proxy start --foreground --port {port}
+Restart=on-failure
+RestartSec=3
+WorkingDirectory=%h
+
+[Install]
+WantedBy=default.target
+"""
+    service_dir = Path.home() / ".config/systemd/user"
+    service_dir.mkdir(parents=True, exist_ok=True)
+    service_file = service_dir / "rdx-proxy.service"
+    service_file.write_text(service_content)
+
+    subprocess.run(["systemctl", "--user", "daemon-reload"])
+    subprocess.run(["systemctl", "--user", "enable", "rdx-proxy"])
+    subprocess.run(["systemctl", "--user", "start", "rdx-proxy"])
+
+    print(f"Installed rdx-proxy.service (port {port})")
+    print(f"  Service file: {service_file}")
+    print(f"  Status:  systemctl --user status rdx-proxy")
+    print(f"  Logs:    journalctl --user -u rdx-proxy -f")
+    print(f"  Stop:    systemctl --user stop rdx-proxy")
+    print(f"  Remove:  systemctl --user disable rdx-proxy && rm {service_file}")
     return 0
 
 
@@ -459,6 +511,14 @@ def cmd_audit(args: argparse.Namespace) -> int:
         print(f"Cleared {count} audit entries.")
         return 0
 
+    if getattr(args, "follow", False):
+        print("Following audit log (Ctrl+C to stop)...")
+        try:
+            logger.follow()
+        except KeyboardInterrupt:
+            print("\nStopped.")
+        return 0
+
     if args.stats:
         stats = logger.get_stats()
         if stats.get("total", 0) == 0:
@@ -568,6 +628,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     start_p = proxy_sub.add_parser("start", help="Start proxy server")
     start_p.add_argument("--port", type=int, default=8100, help="Port (default: 8100)")
+    start_p.add_argument("--foreground", action="store_true", help="Run in foreground (for systemd)")
     start_p.set_defaults(func=cmd_proxy_start)
 
     stop_p = proxy_sub.add_parser("stop", help="Stop proxy server")
@@ -575,6 +636,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     status_p = proxy_sub.add_parser("status", help="Show proxy status")
     status_p.set_defaults(func=cmd_proxy_status)
+
+    install_p = proxy_sub.add_parser("install", help="Install as systemd user service")
+    install_p.add_argument("--port", type=int, default=8100, help="Port (default: 8100)")
+    install_p.set_defaults(func=cmd_proxy_install_systemd)
 
     # init
     init_p = subparsers.add_parser("init", help="Interactive setup wizard")
@@ -650,6 +715,7 @@ def build_parser() -> argparse.ArgumentParser:
     audit_p.add_argument("--stats", action="store_true", help="Show aggregate stats")
     audit_p.add_argument("--clear", action="store_true", help="Clear the audit log")
     audit_p.add_argument("--tail", type=int, default=50, help="Number of recent entries (default 50)")
+    audit_p.add_argument("-f", "--follow", action="store_true", help="Follow log in real-time (like tail -f)")
     audit_p.set_defaults(func=cmd_audit)
 
     # discover

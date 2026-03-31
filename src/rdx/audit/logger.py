@@ -8,6 +8,7 @@ directory.  Each line is a self-contained JSON object matching
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -73,6 +74,31 @@ class AuditLogger:
             stats["redactions"] = stats.get("redactions", 0) + data.get("count", 0)
         return stats
 
+    def follow(self, callback: "Callable[[AuditEntry], None] | None" = None) -> None:
+        """Tail the audit log, printing new entries as they appear (like tail -f).
+
+        Blocks forever. Press Ctrl+C to stop.
+        """
+        import time
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.path.exists():
+            self.path.touch()
+
+        with self.path.open() as f:
+            # Seek to end
+            f.seek(0, 2)
+            while True:
+                line = f.readline()
+                if line.strip():
+                    entry = _dict_to_entry(json.loads(line))
+                    if callback:
+                        callback(entry)
+                    else:
+                        _print_entry(entry)
+                else:
+                    time.sleep(0.3)
+
     def clear(self) -> int:
         """Remove the audit log file. Returns the number of entries removed."""
         if not self.path.exists():
@@ -99,6 +125,19 @@ def _entry_to_dict(entry: AuditEntry) -> dict:
     if entry.detail:
         d["detail"] = entry.detail
     return d
+
+
+def _print_entry(entry: AuditEntry) -> None:
+    """Print a single audit entry to stdout."""
+    import sys
+
+    ts = entry.timestamp[:19]
+    tool = f" [{entry.tool}]" if entry.tool else ""
+    rules = f" rules={','.join(entry.rule_ids)}" if entry.rule_ids else ""
+    count = f" count={entry.count}" if entry.count else ""
+    detail = f" {entry.detail}" if entry.detail else ""
+    print(f"  {ts} {entry.event:10s} {entry.direction:10s}{tool}{rules}{count}{detail}")
+    sys.stdout.flush()
 
 
 def _dict_to_entry(d: dict) -> AuditEntry:

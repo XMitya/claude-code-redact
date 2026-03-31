@@ -1,0 +1,19 @@
+[Unit]
+Description=RDX Redaction Proxy for AI Coding Tools
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/rdx proxy start --foreground --port %i
+Restart=on-failure
+RestartSec=3
+Environment=RDX_VERBOSE=0
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.claude
+
+[Install]
+WantedBy=default.target
