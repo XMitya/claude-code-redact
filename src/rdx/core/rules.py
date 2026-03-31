@@ -36,14 +36,30 @@ def _parse_rule(data: dict[str, Any]) -> Rule:
 
 
 def load_rules_file(path: Path) -> list[Rule]:
-    """Load rules from a YAML file. Returns empty list if file missing or empty."""
+    """Load rules from a YAML file. Returns empty list if file missing or empty.
+
+    Rules with a ``person:`` block are expanded into multiple pattern rules
+    via :func:`~rdx.core.names.expand_person_to_rules`.
+    """
     if not path.exists():
         return []
     with path.open() as f:
         data = yaml.safe_load(f)
     if not data or "rules" not in data:
         return []
-    return [_parse_rule(r) for r in data["rules"]]
+
+    from .names import expand_person_to_rules
+
+    rules: list[Rule] = []
+    for r in data["rules"]:
+        if "person" in r:
+            expanded = expand_person_to_rules(
+                r["id"], r["person"], r.get("category", "NAME")
+            )
+            rules.extend(_parse_rule(er) for er in expanded)
+        else:
+            rules.append(_parse_rule(r))
+    return rules
 
 
 def save_rules_file(path: Path, rules: list[Rule]) -> None:
