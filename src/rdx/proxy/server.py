@@ -163,19 +163,33 @@ async def _forward_raw(request: Request, body: dict, timeout: float) -> Streamin
             headers[key] = value
     upstream_url = _get_upstream_url() + "/v1/messages"
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        if body.get("stream", False):
-            resp = await client.send(
-                client.build_request("POST", upstream_url, headers=headers,
-                                     content=json.dumps(body).encode()),
-                stream=True,
-            )
-            return StreamingResponse(resp.aiter_bytes(), media_type="text/event-stream",
-                                     headers={"cache-control": "no-cache"})
-        else:
+    # NOTE: Do NOT use `async with` — the client must stay alive for the
+    # lifetime of the StreamingResponse.  Closing it early causes httpx.ReadError.
+    client = httpx.AsyncClient(timeout=timeout)
+    if body.get("stream", False):
+        resp = await client.send(
+            client.build_request("POST", upstream_url, headers=headers,
+                                 content=json.dumps(body).encode()),
+            stream=True,
+        )
+
+        async def _raw_stream():
+            try:
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
+            finally:
+                await resp.aclose()
+                await client.aclose()
+
+        return StreamingResponse(_raw_stream(), media_type="text/event-stream",
+                                 headers={"cache-control": "no-cache"})
+    else:
+        try:
             resp = await client.post(upstream_url, headers=headers,
                                      content=json.dumps(body).encode())
             return JSONResponse(resp.json(), status_code=resp.status_code)
+        finally:
+            await client.aclose()
 
 
 async def health(request: Request) -> JSONResponse:
@@ -215,11 +229,11 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
         redacted_body = body
     redact_ms = (_time.monotonic() - t0) * 1000
     _log_body("2_redacted_request", redacted_body, req_id, project_dir)
-    print(f"[rdx] req#{req_id} redaction: {redact_ms:.1f}ms | {_cache.stats()['mappings']} mappings", file=sys.stderr)
+    print(f"[rdx] req#{req_id} redaction: {redact_ms:.1f}ms | {cache.stats()['mappings']} mappings", file=sys.stderr)
 
     # Log outgoing redactions (only when audit enabled)
     if _audit_enabled:
-        all_redactions = _cache.get_all_redactions()
+        all_redactions = cache.get_all_redactions()
         if all_redactions:
             rule_ids = list({r.rule_id for r in all_redactions})
             _audit.log(
@@ -241,30 +255,34 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
 
     upstream_url = _get_upstream_url() + "/v1/messages"
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        if is_streaming:
-            upstream_resp = await client.send(
-                client.build_request(
-                    "POST",
-                    upstream_url,
-                    headers=headers,
-                    content=json.dumps(redacted_body).encode(),
-                ),
-                stream=True,
+    # NOTE: Do NOT use `async with` — the client must stay alive for the
+    # lifetime of the StreamingResponse.  Closing it early causes httpx.ReadError.
+    client = httpx.AsyncClient(timeout=timeout)
+    if is_streaming:
+        upstream_resp = await client.send(
+            client.build_request(
+                "POST",
+                upstream_url,
+                headers=headers,
+                content=json.dumps(redacted_body).encode(),
+            ),
+            stream=True,
+        )
+
+        if upstream_resp.status_code != 200:
+            error_body = await upstream_resp.aread()
+            await client.aclose()
+            try:
+                error_json = json.loads(error_body)
+            except json.JSONDecodeError:
+                error_json = {"error": error_body.decode(errors="replace")}
+            return JSONResponse(
+                error_json,
+                status_code=upstream_resp.status_code,
             )
 
-            if upstream_resp.status_code != 200:
-                error_body = await upstream_resp.aread()
-                try:
-                    error_json = json.loads(error_body)
-                except json.JSONDecodeError:
-                    error_json = {"error": error_body.decode(errors="replace")}
-                return JSONResponse(
-                    error_json,
-                    status_code=upstream_resp.status_code,
-                )
-
-            async def _logged_stream():
+        async def _logged_stream():
+            try:
                 stream_src = (
                     upstream_resp.aiter_bytes()
                     if _no_unredact
@@ -274,7 +292,7 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
                     yield chunk
                 # Log after stream completes
                 if _audit_enabled:
-                    reverse_map = _cache.get_reverse_map()
+                    reverse_map = cache.get_reverse_map()
                     if reverse_map:
                         _audit.log(
                             "unredact", "incoming",
@@ -282,16 +300,20 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
                             count=len(reverse_map),
                             detail=f"{len(reverse_map)} values available for un-redaction (streaming)",
                         )
+            finally:
+                await upstream_resp.aclose()
+                await client.aclose()
 
-            return StreamingResponse(
-                _logged_stream(),
-                media_type="text/event-stream",
-                headers={
-                    "cache-control": "no-cache",
-                    "connection": "keep-alive",
-                },
-            )
-        else:
+        return StreamingResponse(
+            _logged_stream(),
+            media_type="text/event-stream",
+            headers={
+                "cache-control": "no-cache",
+                "connection": "keep-alive",
+            },
+        )
+    else:
+        try:
             upstream_resp = await client.post(
                 upstream_url,
                 headers=headers,
@@ -321,7 +343,7 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
                 _log_body("4_unredacted_response", unredacted_body, req_id, project_dir)
                 print(f"[rdx] req#{req_id} un-redaction: {unredact_ms:.1f}ms", file=sys.stderr)
                 if _audit_enabled:
-                    reverse_map = _cache.get_reverse_map()
+                    reverse_map = cache.get_reverse_map()
                     if reverse_map:
                         _audit.log(
                             "unredact", "incoming",
@@ -333,6 +355,8 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
                 logger.exception("Un-redaction failed on response — passing through as-is")
                 unredacted_body = response_body
             return JSONResponse(unredacted_body)
+        finally:
+            await client.aclose()
 
 
 async def proxy_count_tokens(request: Request) -> JSONResponse:
