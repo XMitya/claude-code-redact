@@ -1,6 +1,6 @@
-"""Tests for streaming client lifecycle and _cache→cache NameError fix.
+"""Tests for the proxy server: streaming client lifecycle and _cache→cache fix.
 
-These tests cover two bugs fixed in server.py:
+Covers two bugs fixed in server.py:
 
 1. httpx.ReadError on streaming — the `async with httpx.AsyncClient` block
    closed the client before StreamingResponse finished reading. The fix
@@ -13,8 +13,9 @@ These tests cover two bugs fixed in server.py:
 
 from __future__ import annotations
 
+import inspect
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -47,8 +48,7 @@ def _make_request(body: dict, headers: dict | None = None) -> Request:
     async def receive():
         return {"type": "http.request", "body": raw_body, "more_body": False}
 
-    request = Request(scope, receive)
-    return request
+    return Request(scope, receive)
 
 
 class _FakeStreamResponse:
@@ -111,7 +111,7 @@ class _FakeAsyncClient:
 
 
 # ---------------------------------------------------------------------------
-# Bug 1: httpx.ReadError — client must stay alive during streaming
+# Streaming client lifecycle — httpx.ReadError fix
 # ---------------------------------------------------------------------------
 
 
@@ -171,7 +171,7 @@ class TestStreamingClientLifecycle:
 
         with patch("rdx.proxy.server.httpx.AsyncClient", return_value=fake_client):
             request = _make_request({"model": "test", "messages": []})
-            response = await _forward_raw(request, {"stream": False}, 30.0)
+            await _forward_raw(request, {"stream": False}, 30.0)
 
         # Non-streaming: client should be closed right away
         assert fake_client.aclosed, "Client was not closed after non-streaming response"
@@ -179,6 +179,7 @@ class TestStreamingClientLifecycle:
     @pytest.mark.asyncio
     async def test_forward_raw_streaming_client_closed_on_exception(self) -> None:
         """If the stream raises an exception, the client is still closed in finally."""
+
         class _ErrorStreamResponse:
             status_code = 200
             aclosed = False
@@ -208,7 +209,7 @@ class TestStreamingClientLifecycle:
 
 
 # ---------------------------------------------------------------------------
-# Bug 2: NameError _cache → cache
+# _cache → cache NameError fix
 # ---------------------------------------------------------------------------
 
 
@@ -223,7 +224,6 @@ class TestCacheVariableName:
         This test sets up a minimal project with .redaction_rules, mocks the
         upstream httpx call, and verifies the request completes without NameError.
         """
-        # Create a temporary project with .redaction_rules
         rules_file = tmp_path / ".redaction_rules"
         rules_file.write_text(
             "rules:\n"
@@ -250,7 +250,7 @@ class TestCacheVariableName:
                 {"type": "text", "text": f"Primary working directory: {tmp_path}"},
             ],
             "messages": [
-                {"role": "user", "content": "My key is sk-test-abc123"},
+                {"role": "user", "content": "My key is sk-test-abcdef123456"},
             ],
         }
 
@@ -266,8 +266,8 @@ class TestCacheVariableName:
     async def test_proxy_messages_no_name_error_with_audit_enabled(self, tmp_path) -> None:
         """proxy_messages should not raise NameError when audit logging is enabled.
 
-        The audit code paths (lines 235-245, 294-302, 345-353) were the primary
-        sites of the _cache→cache bug. Enable audit to exercise them.
+        The audit code paths were the primary sites of the _cache→cache bug.
+        Enable audit to exercise them.
         """
         from rdx.proxy import server as server_module
 
@@ -296,7 +296,7 @@ class TestCacheVariableName:
                 {"type": "text", "text": f"Primary working directory: {tmp_path}"},
             ],
             "messages": [
-                {"role": "user", "content": "My key is sk-test-abc123"},
+                {"role": "user", "content": "My key is sk-test-abcdef123456"},
             ],
         }
 
@@ -337,7 +337,7 @@ class TestCacheVariableName:
                 {"type": "text", "text": f"Primary working directory: {tmp_path}"},
             ],
             "messages": [
-                {"role": "user", "content": "My key is sk-test-abc123"},
+                {"role": "user", "content": "My key is sk-test-abcdef123456"},
             ],
         }
 
@@ -356,7 +356,7 @@ class TestCacheVariableName:
 
     @pytest.mark.asyncio
     async def test_proxy_messages_audit_streaming_no_name_error(self, tmp_path) -> None:
-        """Streaming path with audit enabled — exercises _cache.get_reverse_map()."""
+        """Streaming path with audit enabled — exercises cache.get_reverse_map()."""
         from rdx.proxy import server as server_module
 
         sse_chunks = [
@@ -382,7 +382,7 @@ class TestCacheVariableName:
                 {"type": "text", "text": f"Primary working directory: {tmp_path}"},
             ],
             "messages": [
-                {"role": "user", "content": "My key is sk-test-abc123"},
+                {"role": "user", "content": "My key is sk-test-abcdef123456"},
             ],
         }
 
@@ -404,20 +404,16 @@ class TestCacheVariableName:
 
 
 # ---------------------------------------------------------------------------
-# Integration: verify no _cache references remain in source
+# Source-level regression guards
 # ---------------------------------------------------------------------------
 
 
-class TestNoCacheUnderscoreReferences:
-    """Ensure the source code has no remaining _cache attribute references
-    inside proxy_messages (the bug was _cache→cache)."""
+class TestSourceGuards:
+    """Ensure the fixed code patterns do not regress."""
 
     def test_no_cache_underscore_in_proxy_messages(self) -> None:
-        """The proxy_messages function should not reference _cache (module-level
-        dict) for per-project operations. It should use the local `cache` variable."""
-        import inspect
-        from rdx.proxy.server import proxy_messages
-
+        """proxy_messages should not reference _cache (module-level dict)
+        for per-project operations. It should use the local `cache` variable."""
         source = inspect.getsource(proxy_messages)
 
         # _caches (with trailing 's') is the module-level dict — that's fine.
@@ -431,9 +427,6 @@ class TestNoCacheUnderscoreReferences:
     def test_no_async_with_httpx_in_forward_raw(self) -> None:
         """_forward_raw should not use 'async with httpx.AsyncClient' —
         the context manager closes the client before streaming finishes."""
-        import inspect
-        from rdx.proxy.server import _forward_raw
-
         source = inspect.getsource(_forward_raw)
         assert "async with httpx.AsyncClient" not in source, (
             "_forward_raw uses 'async with httpx.AsyncClient' which causes "
@@ -443,9 +436,6 @@ class TestNoCacheUnderscoreReferences:
     def test_no_async_with_httpx_in_proxy_messages_streaming(self) -> None:
         """proxy_messages should not use 'async with httpx.AsyncClient' —
         the context manager closes the client before streaming finishes."""
-        import inspect
-        from rdx.proxy.server import proxy_messages
-
         source = inspect.getsource(proxy_messages)
         assert "async with httpx.AsyncClient" not in source, (
             "proxy_messages uses 'async with httpx.AsyncClient' which causes "
