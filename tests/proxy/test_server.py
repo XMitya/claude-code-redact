@@ -460,3 +460,26 @@ class TestHelloEndpoint:
         assert response.status_code == 200
         body = json.loads(response.body)
         assert body["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Header forwarding — x-api-key must be passed through
+# ---------------------------------------------------------------------------
+
+
+class TestForwardHeaders:
+    """Verify that all headers Claude Code sends are forwarded to upstream."""
+
+    def test_x_api_key_in_forward_headers(self) -> None:
+        """x-api-key must be in _FORWARD_HEADERS.
+
+        Claude Code sends the Anthropic API key via the x-api-key header,
+        not authorization. Without this header, Anthropic treats requests
+        as anonymous and returns 429 (rate limited).
+        """
+        from rdx.proxy.server import _FORWARD_HEADERS
+
+        assert "x-api-key" in _FORWARD_HEADERS, (
+            "x-api-key is missing from _FORWARD_HEADERS. "
+            "Claude Code sends the API key via x-api-key, not authorization."
+        )

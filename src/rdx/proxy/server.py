@@ -74,6 +74,7 @@ def _log_body(label: str, body: dict, request_id: int, project_dir: "Path | None
 # Headers to forward from client to upstream.
 _FORWARD_HEADERS = frozenset({
     "authorization",
+    "x-api-key",
     "anthropic-version",
     "anthropic-beta",
     "content-type",
