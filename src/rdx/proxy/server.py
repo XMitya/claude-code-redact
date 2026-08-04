@@ -31,8 +31,8 @@ def _get_audit_dir() -> "Path":
     return Path(rules_dir) if rules_dir else Path.cwd()
 
 _audit = AuditLogger(_get_audit_dir())
-_audit_enabled = False
-_log_bodies = False
+_audit_enabled = os.environ.get("RDX_AUDIT", "").lower() in ("1", "true", "yes")
+_log_bodies = os.environ.get("RDX_LOG_BODIES", "").lower() in ("1", "true", "yes")
 _no_unredact = False
 
 
@@ -70,6 +70,12 @@ def _log_body(label: str, body: dict, request_id: int, project_dir: "Path | None
     with open(path, "w") as f:
         json.dump(body, f, indent=2, default=str)
     print(f"[rdx] {label} → {path}", file=sys.stderr)
+    # Also print a truncated summary to stderr for quick inspection
+    body_str = json.dumps(body, default=str)
+    if len(body_str) > 2000:
+        print(f"[rdx] {label} (truncated): {body_str[:2000]}...", file=sys.stderr)
+    else:
+        print(f"[rdx] {label}: {body_str}", file=sys.stderr)
 
 # Headers that should NOT be forwarded to upstream — httpx manages these
 # automatically (content-length is recalculated, host is derived from URL).
@@ -91,11 +97,12 @@ _shared_client: httpx.AsyncClient | None = None
 
 
 def _get_client(timeout: float) -> httpx.AsyncClient:
-    """Return a shared AsyncClient with connection pooling."""
+    """Return a shared AsyncClient with connection pooling and HTTP/2."""
     global _shared_client
     if _shared_client is None or _shared_client.is_closed:
         _shared_client = httpx.AsyncClient(
             timeout=timeout,
+            http2=True,
             limits=httpx.Limits(
                 max_connections=10,
                 max_keepalive_connections=5,
@@ -251,7 +258,8 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
     req_id = _request_counter
 
     timeout = _get_timeout()
-    body = await request.json()
+    raw_body = await request.body()
+    body = json.loads(raw_body)
     print(f"[rdx] req#{req_id} original stream={body.get('stream', 'MISSING')} model={body.get('model', 'MISSING')}", file=sys.stderr)
 
     # Detect which project this request belongs to
@@ -276,8 +284,62 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
         redacted_body = body
     redact_ms = (_time.monotonic() - t0) * 1000
     _log_body("2_redacted_request", redacted_body, req_id, project_dir)
-    print(f"[rdx] req#{req_id} redaction: {redact_ms:.1f}ms | {cache.stats()['mappings']} mappings", file=sys.stderr)
+    mappings_count = cache.stats()['mappings']
+    print(f"[rdx] req#{req_id} redaction: {redact_ms:.1f}ms | {mappings_count} mappings", file=sys.stderr)
     print(f"[rdx] req#{req_id} incoming headers: {dict(request.headers)}", file=sys.stderr)
+
+    # If no redactions were applied, send the original raw body unchanged.
+    # Re-serializing via json.dumps changes byte layout (whitespace, key order),
+    # which can break prompt caching and fingerprinting at Anthropic.
+    if mappings_count == 0:
+        # Use raw body — same bytes Claude Code sent
+        body_to_send = raw_body
+        is_streaming = body.get("stream", False)
+        # Forward as raw passthrough with full headers
+        headers = _build_upstream_headers(request)
+        upstream_url = _get_upstream_url() + "/v1/messages"
+        qs = str(request.url.query) if request.url.query else ""
+        if qs:
+            upstream_url = f"{upstream_url}?{qs}"
+        print(f"[rdx] req#{req_id} 0 mappings — sending raw body ({len(raw_body)} bytes), is_streaming={is_streaming}", file=sys.stderr)
+        if _log_bodies:
+            body_preview = raw_body.decode(errors="replace")[:2000]
+            print(f"[rdx] req#{req_id} raw body: {body_preview}{'...' if len(raw_body) > 2000 else ''}", file=sys.stderr)
+        client = _get_client(timeout)
+        if is_streaming:
+            upstream_resp = await client.send(
+                client.build_request("POST", upstream_url, headers=headers, content=body_to_send),
+                stream=True,
+            )
+            if upstream_resp.status_code != 200:
+                error_body = await upstream_resp.aread()
+                await upstream_resp.aclose()
+                try:
+                    error_json = json.loads(error_body)
+                except json.JSONDecodeError:
+                    error_json = {"error": error_body.decode(errors="replace")}
+                print(f"[rdx] req#{req_id} upstream {upstream_resp.status_code}: {error_json}", file=sys.stderr)
+                return JSONResponse(error_json, status_code=upstream_resp.status_code)
+
+            async def _raw_passthrough_stream():
+                try:
+                    async for chunk in upstream_resp.aiter_bytes():
+                        yield chunk
+                finally:
+                    await upstream_resp.aclose()
+
+            return StreamingResponse(_raw_passthrough_stream(), media_type="text/event-stream",
+                                     headers={"cache-control": "no-cache"})
+        else:
+            upstream_resp = await client.post(upstream_url, headers=headers, content=body_to_send)
+            if upstream_resp.status_code != 200:
+                try:
+                    error_json = upstream_resp.json()
+                except (json.JSONDecodeError, ValueError):
+                    error_json = {"error": upstream_resp.text}
+                print(f"[rdx] req#{req_id} upstream {upstream_resp.status_code}: {error_json}", file=sys.stderr)
+                return JSONResponse(error_json, status_code=upstream_resp.status_code)
+            return JSONResponse(upstream_resp.json(), status_code=upstream_resp.status_code)
 
     # Log outgoing redactions (only when audit enabled)
     if _audit_enabled:
