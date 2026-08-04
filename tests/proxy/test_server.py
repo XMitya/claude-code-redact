@@ -441,3 +441,22 @@ class TestSourceGuards:
             "proxy_messages uses 'async with httpx.AsyncClient' which causes "
             "httpx.ReadError on streaming responses."
         )
+
+
+# ---------------------------------------------------------------------------
+# /api/hello connectivity check endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestHelloEndpoint:
+    """Verify the /api/hello endpoint that Claude Code uses for connectivity checks."""
+
+    @pytest.mark.asyncio
+    async def test_hello_get_returns_200(self) -> None:
+        from rdx.proxy.server import hello
+
+        request = _make_request({})
+        response = await hello(request)
+        assert response.status_code == 200
+        body = json.loads(response.body)
+        assert body["status"] == "ok"

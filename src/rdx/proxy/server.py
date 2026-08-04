@@ -197,6 +197,15 @@ async def health(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "projects": len(_caches)})
 
 
+async def hello(request: Request) -> JSONResponse:
+    """Connectivity check endpoint for Claude Code.
+
+    Claude Code sends HEAD /api/hello before each session to verify
+    the API base URL is reachable.  Return 200 so it doesn't log a 404.
+    """
+    return JSONResponse({"status": "ok"})
+
+
 async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
     """Proxy POST /v1/messages — redact outgoing, un-redact incoming."""
     import time as _time
@@ -386,6 +395,7 @@ async def proxy_count_tokens(request: Request) -> JSONResponse:
 app = Starlette(
     routes=[
         Route("/health", health, methods=["GET"]),
+        Route("/api/hello", hello, methods=["GET", "HEAD"]),
         Route("/v1/messages", proxy_messages, methods=["POST"]),
         Route("/v1/messages/count_tokens", proxy_count_tokens, methods=["POST"]),
     ],
