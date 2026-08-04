@@ -468,18 +468,27 @@ class TestHelloEndpoint:
 
 
 class TestForwardHeaders:
-    """Verify that all headers Claude Code sends are forwarded to upstream."""
+    """Verify that headers are forwarded to upstream."""
 
-    def test_x_api_key_in_forward_headers(self) -> None:
-        """x-api-key must be in _FORWARD_HEADERS.
+    def test_x_api_key_forwarded(self) -> None:
+        """x-api-key must be forwarded to upstream.
 
-        Claude Code sends the Anthropic API key via the x-api-key header,
-        not authorization. Without this header, Anthropic treats requests
-        as anonymous and returns 429 (rate limited).
+        Claude Code sends the API key via the x-api-key header, not
+        authorization. The proxy must forward all headers except
+        hop-by-hop and content-length.
         """
-        from rdx.proxy.server import _FORWARD_HEADERS
+        from rdx.proxy.server import _build_upstream_headers, _DROP_HEADERS
 
-        assert "x-api-key" in _FORWARD_HEADERS, (
-            "x-api-key is missing from _FORWARD_HEADERS. "
-            "Claude Code sends the API key via x-api-key, not authorization."
-        )
+        # _DROP_HEADERS should NOT contain x-api-key, authorization,
+        # anthropic-version, anthropic-beta, user-agent, etc.
+        assert "x-api-key" not in _DROP_HEADERS
+        assert "authorization" not in _DROP_HEADERS
+        assert "anthropic-version" not in _DROP_HEADERS
+        assert "anthropic-beta" not in _DROP_HEADERS
+        assert "user-agent" not in _DROP_HEADERS
+
+        # But should drop hop-by-hop headers
+        assert "host" in _DROP_HEADERS
+        assert "content-length" in _DROP_HEADERS
+        assert "connection" in _DROP_HEADERS
+        assert "accept-encoding" in _DROP_HEADERS

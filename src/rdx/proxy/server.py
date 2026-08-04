@@ -71,17 +71,28 @@ def _log_body(label: str, body: dict, request_id: int, project_dir: "Path | None
         json.dump(body, f, indent=2, default=str)
     print(f"[rdx] {label} → {path}", file=sys.stderr)
 
-# Headers to forward from client to upstream.
-_FORWARD_HEADERS = frozenset({
-    "authorization",
-    "x-api-key",
-    "anthropic-version",
-    "anthropic-beta",
-    "content-type",
+# Headers that should NOT be forwarded to upstream — httpx manages these
+# automatically (content-length is recalculated, host is derived from URL).
+_DROP_HEADERS = frozenset({
+    "host",
+    "content-length",
+    "connection",
+    "transfer-encoding",
+    "accept-encoding",
 })
 
 DEFAULT_UPSTREAM = "https://api.anthropic.com"
 DEFAULT_TIMEOUT = 300.0
+
+
+def _build_upstream_headers(request: Request) -> dict[str, str]:
+    """Forward all request headers to upstream, except hop-by-hop and
+    content-length (httpx recalculates these automatically)."""
+    return {
+        k: v
+        for k, v in request.headers.items()
+        if k.lower() not in _DROP_HEADERS
+    }
 
 
 def _get_upstream_url() -> str:
@@ -157,11 +168,7 @@ def _get_cache(project_dir: "Path | None") -> MappingCache:
 
 async def _forward_raw(request: Request, body: dict, timeout: float) -> StreamingResponse | JSONResponse:
     """Forward request to upstream without any redaction."""
-    headers = {}
-    for key in _FORWARD_HEADERS:
-        value = request.headers.get(key)
-        if value is not None:
-            headers[key] = value
+    headers = _build_upstream_headers(request)
     upstream_url = _get_upstream_url() + "/v1/messages"
     # Preserve query string (e.g. ?beta=true) from the original request
     qs = request.url.query.decode() if request.url.query else ""
@@ -177,6 +184,16 @@ async def _forward_raw(request: Request, body: dict, timeout: float) -> Streamin
                                  content=json.dumps(body).encode()),
             stream=True,
         )
+        if resp.status_code != 200:
+            error_body = await resp.aread()
+            await resp.aclose()
+            await client.aclose()
+            try:
+                error_json = json.loads(error_body)
+            except json.JSONDecodeError:
+                error_json = {"error": error_body.decode(errors="replace")}
+            print(f"[rdx] _forward_raw upstream {resp.status_code}: {error_json}", file=sys.stderr)
+            return JSONResponse(error_json, status_code=resp.status_code)
 
         async def _raw_stream():
             try:
@@ -244,6 +261,7 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
     redact_ms = (_time.monotonic() - t0) * 1000
     _log_body("2_redacted_request", redacted_body, req_id, project_dir)
     print(f"[rdx] req#{req_id} redaction: {redact_ms:.1f}ms | {cache.stats()['mappings']} mappings", file=sys.stderr)
+    print(f"[rdx] req#{req_id} incoming headers: {dict(request.headers)}", file=sys.stderr)
 
     # Log outgoing redactions (only when audit enabled)
     if _audit_enabled:
@@ -261,11 +279,7 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
     is_streaming = redacted_body.get("stream", False)
 
     # Build upstream headers
-    headers = {}
-    for key in _FORWARD_HEADERS:
-        value = request.headers.get(key)
-        if value is not None:
-            headers[key] = value
+    headers = _build_upstream_headers(request)
 
     upstream_url = _get_upstream_url() + "/v1/messages"
     # Preserve query string (e.g. ?beta=true) from the original request
@@ -294,6 +308,8 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
                 error_json = json.loads(error_body)
             except json.JSONDecodeError:
                 error_json = {"error": error_body.decode(errors="replace")}
+            print(f"[rdx] req#{req_id} upstream {upstream_resp.status_code}: {error_json}", file=sys.stderr)
+            print(f"[rdx] req#{req_id} upstream headers: {dict(upstream_resp.headers)}", file=sys.stderr)
             return JSONResponse(
                 error_json,
                 status_code=upstream_resp.status_code,
@@ -379,11 +395,7 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
 
 async def proxy_count_tokens(request: Request) -> JSONResponse:
     """Proxy POST /v1/messages/count_tokens — passthrough, no redaction."""
-    headers = {}
-    for key in _FORWARD_HEADERS:
-        value = request.headers.get(key)
-        if value is not None:
-            headers[key] = value
+    headers = _build_upstream_headers(request)
 
     body = await request.body()
     upstream_url = _get_upstream_url() + "/v1/messages/count_tokens"
