@@ -22,6 +22,7 @@ import pytest
 from starlette.requests import Request
 
 from rdx.proxy.server import _forward_raw, proxy_messages
+from rdx.proxy import server as server_module
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +86,7 @@ class _FakeAsyncClient:
         self._stream = stream
         self.aclosed = False
         self.requests_made = 0
+        self.is_closed = False
 
     def build_request(self, *args, **kwargs):
         return httpx.Request("POST", args[1])
@@ -108,6 +110,16 @@ class _FakeAsyncClient:
 
     async def aclose(self):
         self.aclosed = True
+        self.is_closed = True
+
+
+@pytest.fixture(autouse=True)
+def _reset_shared_client():
+    """Reset the shared httpx client between tests."""
+    old = server_module._shared_client
+    server_module._shared_client = None
+    yield
+    server_module._shared_client = old
 
 
 # ---------------------------------------------------------------------------
@@ -126,12 +138,11 @@ class TestStreamingClientLifecycle:
         fake_resp = _FakeStreamResponse(chunks)
         fake_client = _FakeAsyncClient(fake_resp, stream=True)
 
-        with patch("rdx.proxy.server.httpx.AsyncClient", return_value=fake_client):
+        with patch.object(server_module, "_get_client", return_value=fake_client):
             request = _make_request({"model": "test", "stream": True, "messages": []})
             response = await _forward_raw(request, {"stream": True}, 30.0)
 
         # Client should NOT be closed yet — stream hasn't been consumed
-        assert not fake_client.aclosed, "Client was closed before stream consumption"
         assert not fake_resp.aclosed, "Response was closed before stream consumption"
 
         # Now consume the stream
@@ -139,9 +150,9 @@ class TestStreamingClientLifecycle:
         async for chunk in response.body_iterator:
             collected.append(chunk)
 
-        # After full consumption, both client and response should be closed
+        # After full consumption, response should be closed
+        # (shared client stays alive for connection pooling)
         assert fake_resp.aclosed, "Response was not closed after stream completed"
-        assert fake_client.aclosed, "Client was not closed after stream completed"
         assert b"".join(collected) == b"".join(chunks)
 
     @pytest.mark.asyncio
@@ -151,7 +162,7 @@ class TestStreamingClientLifecycle:
         fake_resp = _FakeStreamResponse(chunks)
         fake_client = _FakeAsyncClient(fake_resp, stream=True)
 
-        with patch("rdx.proxy.server.httpx.AsyncClient", return_value=fake_client):
+        with patch.object(server_module, "_get_client", return_value=fake_client):
             request = _make_request({"model": "test", "stream": True, "messages": []})
             response = await _forward_raw(request, {"stream": True}, 30.0)
 
@@ -161,7 +172,6 @@ class TestStreamingClientLifecycle:
             collected.append(chunk)
 
         assert len(collected) == 50
-        assert fake_client.aclosed
         assert fake_resp.aclosed
 
     @pytest.mark.asyncio
@@ -169,12 +179,11 @@ class TestStreamingClientLifecycle:
         """Non-streaming path should close client immediately after response."""
         fake_client = _FakeAsyncClient({"status": "ok"})
 
-        with patch("rdx.proxy.server.httpx.AsyncClient", return_value=fake_client):
+        with patch.object(server_module, "_get_client", return_value=fake_client):
             request = _make_request({"model": "test", "messages": []})
             await _forward_raw(request, {"stream": False}, 30.0)
 
-        # Non-streaming: client should be closed right away
-        assert fake_client.aclosed, "Client was not closed after non-streaming response"
+        # Non-streaming: response is consumed immediately, shared client stays alive
 
     @pytest.mark.asyncio
     async def test_forward_raw_streaming_client_closed_on_exception(self) -> None:
@@ -194,7 +203,7 @@ class TestStreamingClientLifecycle:
         fake_resp = _ErrorStreamResponse()
         fake_client = _FakeAsyncClient(fake_resp, stream=True)
 
-        with patch("rdx.proxy.server.httpx.AsyncClient", return_value=fake_client):
+        with patch.object(server_module, "_get_client", return_value=fake_client):
             request = _make_request({"model": "test", "stream": True, "messages": []})
             response = await _forward_raw(request, {"stream": True}, 30.0)
 
@@ -203,9 +212,8 @@ class TestStreamingClientLifecycle:
             async for _ in response.body_iterator:
                 pass
 
-        # Client and response should still be closed via finally
+        # Response should still be closed via finally
         assert fake_resp.aclosed, "Response was not closed after stream error"
-        assert fake_client.aclosed, "Client was not closed after stream error"
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +262,7 @@ class TestCacheVariableName:
             ],
         }
 
-        with patch("rdx.proxy.server.httpx.AsyncClient", return_value=fake_client):
+        with patch.object(server_module, "_get_client", return_value=fake_client):
             request = _make_request(body)
             # This should NOT raise NameError
             response = await proxy_messages(request)
@@ -304,7 +312,7 @@ class TestCacheVariableName:
         old_audit = server_module._audit_enabled
         server_module._audit_enabled = True
         try:
-            with patch("rdx.proxy.server.httpx.AsyncClient", return_value=fake_client):
+            with patch.object(server_module, "_get_client", return_value=fake_client):
                 request = _make_request(body)
                 response = await proxy_messages(request)
             assert response.status_code == 200
@@ -341,7 +349,7 @@ class TestCacheVariableName:
             ],
         }
 
-        with patch("rdx.proxy.server.httpx.AsyncClient", return_value=fake_client):
+        with patch.object(server_module, "_get_client", return_value=fake_client):
             request = _make_request(body)
             response = await proxy_messages(request)
 
@@ -351,8 +359,8 @@ class TestCacheVariableName:
             collected.append(chunk)
 
         assert len(collected) > 0
-        # Client should be closed after stream completes
-        assert fake_client.aclosed
+        # Response should be closed after stream completes
+        assert fake_resp.aclosed
 
     @pytest.mark.asyncio
     async def test_proxy_messages_audit_streaming_no_name_error(self, tmp_path) -> None:
@@ -389,7 +397,7 @@ class TestCacheVariableName:
         old_audit = server_module._audit_enabled
         server_module._audit_enabled = True
         try:
-            with patch("rdx.proxy.server.httpx.AsyncClient", return_value=fake_client):
+            with patch.object(server_module, "_get_client", return_value=fake_client):
                 request = _make_request(body)
                 response = await proxy_messages(request)
 
@@ -398,7 +406,7 @@ class TestCacheVariableName:
                 collected.append(chunk)
 
             assert len(collected) > 0
-            assert fake_client.aclosed
+            assert fake_resp.aclosed
         finally:
             server_module._audit_enabled = old_audit
 
