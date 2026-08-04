@@ -163,6 +163,10 @@ async def _forward_raw(request: Request, body: dict, timeout: float) -> Streamin
         if value is not None:
             headers[key] = value
     upstream_url = _get_upstream_url() + "/v1/messages"
+    # Preserve query string (e.g. ?beta=true) from the original request
+    qs = request.url.query.decode() if request.url.query else ""
+    if qs:
+        upstream_url = f"{upstream_url}?{qs}"
 
     # NOTE: Do NOT use `async with` — the client must stay alive for the
     # lifetime of the StreamingResponse.  Closing it early causes httpx.ReadError.
@@ -264,6 +268,10 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
             headers[key] = value
 
     upstream_url = _get_upstream_url() + "/v1/messages"
+    # Preserve query string (e.g. ?beta=true) from the original request
+    qs = str(request.url.query) if request.url.query else ""
+    if qs:
+        upstream_url = f"{upstream_url}?{qs}"
 
     # NOTE: Do NOT use `async with` — the client must stay alive for the
     # lifetime of the StreamingResponse.  Closing it early causes httpx.ReadError.
@@ -379,6 +387,10 @@ async def proxy_count_tokens(request: Request) -> JSONResponse:
 
     body = await request.body()
     upstream_url = _get_upstream_url() + "/v1/messages/count_tokens"
+    # Preserve query string from the original request
+    qs = str(request.url.query) if request.url.query else ""
+    if qs:
+        upstream_url = f"{upstream_url}?{qs}"
     timeout = _get_timeout()
 
     async with httpx.AsyncClient(timeout=timeout) as client:
