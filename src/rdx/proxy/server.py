@@ -199,7 +199,7 @@ async def _forward_raw(request: Request, body: dict, timeout: float) -> Streamin
     headers = _build_upstream_headers(request)
     upstream_url = _get_upstream_url() + "/v1/messages"
     # Preserve query string (e.g. ?beta=true) from the original request
-    qs = request.url.query.decode() if request.url.query else ""
+    qs = str(request.url.query) if request.url.query else ""
     if qs:
         upstream_url = f"{upstream_url}?{qs}"
 
