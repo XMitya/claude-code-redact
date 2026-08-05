@@ -33,6 +33,7 @@ def _get_audit_dir() -> "Path":
 _audit = AuditLogger(_get_audit_dir())
 _audit_enabled = os.environ.get("RDX_AUDIT", "").lower() in ("1", "true", "yes")
 _log_bodies = os.environ.get("RDX_LOG_BODIES", "").lower() in ("1", "true", "yes")
+_log_headers = os.environ.get("RDX_LOG_HEADERS", "").lower() in ("1", "true", "yes")
 _no_unredact = False
 
 
@@ -286,7 +287,8 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
     _log_body("2_redacted_request", redacted_body, req_id, project_dir)
     mappings_count = cache.stats()['mappings']
     print(f"[rdx] req#{req_id} redaction: {redact_ms:.1f}ms | {mappings_count} mappings", file=sys.stderr)
-    print(f"[rdx] req#{req_id} incoming headers: {dict(request.headers)}", file=sys.stderr)
+    if _log_headers:
+        print(f"[rdx] req#{req_id} incoming headers: {dict(request.headers)}", file=sys.stderr)
 
     # If no redactions were applied, send the original raw body unchanged.
     # Re-serializing via json.dumps changes byte layout (whitespace, key order),
@@ -366,7 +368,8 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
         upstream_url = f"{upstream_url}?{qs}"
 
     print(f"[rdx] req#{req_id} is_streaming={is_streaming} upstream_url={upstream_url}", file=sys.stderr)
-    print(f"[rdx] req#{req_id} forward headers: {headers}", file=sys.stderr)
+    if _log_headers:
+        print(f"[rdx] req#{req_id} forward headers: {headers}", file=sys.stderr)
 
     # NOTE: Do NOT use `async with` — the client must stay alive for the
     # lifetime of the StreamingResponse.  Closing it early causes httpx.ReadError.
@@ -390,7 +393,8 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
             except json.JSONDecodeError:
                 error_json = {"error": error_body.decode(errors="replace")}
             print(f"[rdx] req#{req_id} upstream {upstream_resp.status_code}: {error_json}", file=sys.stderr)
-            print(f"[rdx] req#{req_id} upstream headers: {dict(upstream_resp.headers)}", file=sys.stderr)
+            if _log_headers:
+                print(f"[rdx] req#{req_id} upstream headers: {dict(upstream_resp.headers)}", file=sys.stderr)
             return JSONResponse(
                 error_json,
                 status_code=upstream_resp.status_code,
@@ -439,7 +443,8 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
             except (json.JSONDecodeError, ValueError):
                 error_json = {"error": upstream_resp.text}
             print(f"[rdx] req#{req_id} upstream {upstream_resp.status_code}: {error_json}", file=sys.stderr)
-            print(f"[rdx] req#{req_id} upstream resp headers: {dict(upstream_resp.headers)}", file=sys.stderr)
+            if _log_headers:
+                print(f"[rdx] req#{req_id} upstream resp headers: {dict(upstream_resp.headers)}", file=sys.stderr)
             return JSONResponse(
                 error_json,
                 status_code=upstream_resp.status_code,
