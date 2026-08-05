@@ -17,13 +17,26 @@ class Unredactor:
         if not reverse_map:
             return text
 
-        # Sort by replacement length (longest first) to avoid partial-match
-        # corruption — e.g. replacing "__RDX_NAME_" before "__RDX_NAME_a1b2__".
+        # Build a case-insensitive lookup: lowercase token -> original
+        # This handles _match_case() in redactor.py which may change the
+        # token case (e.g. __RDX_KEY_abc123__ -> __rdx_key_abc123__).
+        ci_map = {k.lower(): v for k, v in reverse_map.items()}
+
+        # Sort by token length (longest first) to avoid partial-match
+        # corruption — e.g. replacing "__rdx_name_" before "__rdx_name_a1b2__".
         result = text
-        for replacement, original in sorted(
-            reverse_map.items(), key=lambda x: -len(x[0])
+        for ci_token, original in sorted(
+            ci_map.items(), key=lambda x: -len(x[0])
         ):
-            result = result.replace(replacement, original)
+            # Case-insensitive replace
+            lower_result = result.lower()
+            lower_token = ci_token
+            while True:
+                pos = lower_result.find(lower_token)
+                if pos == -1:
+                    break
+                result = result[:pos] + original + result[pos + len(lower_token):]
+                lower_result = result.lower()
 
         return result
 

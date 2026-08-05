@@ -192,8 +192,8 @@ async def unredact_stream(
 
             if delta_type == "input_json_delta":
                 tool_buffer.feed(index, delta.get("partial_json", ""))
-                # Pass through the original delta — we'll fix up at block stop.
-                yield _format_sse(event_type, json.dumps(data))
+                # Buffer — don't yield yet. We'll emit the complete
+                # unredacted JSON at content_block_stop.
                 continue
 
         if msg_type == "content_block_stop":
@@ -208,11 +208,15 @@ async def unredact_stream(
                 }
                 yield _format_sse("content_block_delta", json.dumps(text_delta_event))
 
-            # We don't rewrite tool_use JSON at block stop in the stream —
-            # tool input was already passed through as deltas above.
-            # The un-redaction for tool_use happens at the client level
-            # when the complete tool input is assembled.
-            tool_buffer.flush(index, unredactor)
+            # Emit unredacted tool_use JSON as a single input_json_delta
+            unredacted_json = tool_buffer.flush(index, unredactor)
+            if unredacted_json is not None:
+                tool_delta_event = {
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "input_json_delta", "partial_json": unredacted_json},
+                }
+                yield _format_sse("content_block_delta", json.dumps(tool_delta_event))
 
         # Pass through the event as-is (message_start, message_delta,
         # message_stop, ping, content_block_start, content_block_stop, etc.)
