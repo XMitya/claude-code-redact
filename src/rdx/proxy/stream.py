@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -187,6 +188,10 @@ async def unredact_stream(
             continue
 
         msg_type = data.get("type", "")
+
+        # Diagnostic: log raw data containing __rdx or __RDX
+        if "__rdx" in raw_data.lower():
+            print(f"[rdx][unredact] {msg_type} delta contains token: {raw_data[:300]}", file=sys.stderr)
 
         if msg_type == "content_block_delta":
             delta = data.get("delta", {})
