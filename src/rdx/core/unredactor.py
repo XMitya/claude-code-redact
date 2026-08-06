@@ -5,6 +5,23 @@ from __future__ import annotations
 from .mappings import MappingCache
 
 
+def _match_case(template: str, text: str) -> str:
+    """Adjust text to match the case style of template.
+
+    - ALL UPPER → ALL UPPER
+    - all lower → all lower
+    - Title Case → Title Case
+    - Otherwise → text as-is
+    """
+    if template.isupper():
+        return text.upper()
+    if template.islower():
+        return text.lower()
+    if template.istitle():
+        return text.title()
+    return text
+
+
 class Unredactor:
     """Reverses redactions using the in-memory mapping cache."""
 
@@ -28,14 +45,19 @@ class Unredactor:
         for ci_token, original in sorted(
             ci_map.items(), key=lambda x: -len(x[0])
         ):
-            # Case-insensitive replace
+            # Case-insensitive replace, preserving the case style of the
+            # replacement found in text (reverse of _match_case in redactor).
             lower_result = result.lower()
             lower_token = ci_token
             while True:
                 pos = lower_result.find(lower_token)
                 if pos == -1:
                     break
-                result = result[:pos] + original + result[pos + len(lower_token):]
+                # Extract the actual replacement text from the result
+                found = result[pos:pos + len(ci_token)]
+                # Match the case style of 'found' to the original
+                restored = _match_case(found, original)
+                result = result[:pos] + restored + result[pos + len(ci_token):]
                 lower_result = result.lower()
 
         return result
