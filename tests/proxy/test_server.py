@@ -134,7 +134,11 @@ class TestStreamingClientLifecycle:
     async def test_forward_raw_streaming_client_not_closed_prematurely(self) -> None:
         """In _forward_raw streaming mode, the client must not be closed
         before the stream is fully consumed."""
-        chunks = [b'{"type":"message_start"}', b'{"type":"message_stop"}']
+        # SSE-formatted chunks (unredact_stream expects event:/data: lines)
+        chunks = [
+            b'event: message_start\ndata: {"type":"message_start"}\n\n',
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
         fake_resp = _FakeStreamResponse(chunks)
         fake_client = _FakeAsyncClient(fake_resp, stream=True)
 
@@ -151,14 +155,20 @@ class TestStreamingClientLifecycle:
             collected.append(chunk)
 
         # After full consumption, response should be closed
-        # (shared client stays alive for connection pooling)
         assert fake_resp.aclosed, "Response was not closed after stream completed"
-        assert b"".join(collected) == b"".join(chunks)
+        # Output should contain the SSE events
+        combined = b"".join(collected)
+        assert b"message_start" in combined
+        assert b"message_stop" in combined
 
     @pytest.mark.asyncio
     async def test_forward_raw_streaming_multi_chunk(self) -> None:
         """Streaming with many chunks — client stays alive until the last one."""
-        chunks = [f"chunk-{i}\n".encode() for i in range(50)]
+        # SSE-formatted chunks
+        chunks = [
+            f'event: ping\ndata: {{"type":"ping","i":{i}}}\n\n'.encode()
+            for i in range(50)
+        ]
         fake_resp = _FakeStreamResponse(chunks)
         fake_client = _FakeAsyncClient(fake_resp, stream=True)
 
@@ -171,7 +181,8 @@ class TestStreamingClientLifecycle:
         async for chunk in response.body_iterator:
             collected.append(chunk)
 
-        assert len(collected) == 50
+        combined = b"".join(collected)
+        assert combined.count(b'"i":') == 50
         assert fake_resp.aclosed
 
     @pytest.mark.asyncio
@@ -195,6 +206,10 @@ class TestStreamingClientLifecycle:
 
             async def aiter_bytes(self):
                 yield b"first chunk"
+                raise RuntimeError("connection lost")
+
+            async def aiter_lines(self):
+                yield "first chunk"
                 raise RuntimeError("connection lost")
 
             async def aclose(self):

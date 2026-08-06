@@ -183,25 +183,30 @@ def _build_rules_for_project(project_dir: "Path | None") -> list:
     return merged
 
 
-# Per-project mapping caches — keyed by project dir path.
-_caches: dict[str, MappingCache] = {}
+# Global mapping cache — shared across all projects so that tokens
+# created in one project's request can be unredacted in any response,
+# even when the current request goes through _forward_raw (no rules).
+_global_cache = MappingCache()
 
 
 def _get_cache(project_dir: "Path | None") -> MappingCache:
-    key = str(project_dir) if project_dir else "__default__"
-    if key not in _caches:
-        _caches[key] = MappingCache()
-    return _caches[key]
+    return _global_cache
 
 
 async def _forward_raw(request: Request, body: dict, timeout: float) -> StreamingResponse | JSONResponse:
-    """Forward request to upstream without any redaction."""
+    """Forward request to upstream without any redaction.
+
+    Still un-redacts the response using the global cache — tokens from
+    prior requests in the same session may appear in Anthropic's response.
+    """
     headers = _build_upstream_headers(request)
     upstream_url = _get_upstream_url() + "/v1/messages"
     # Preserve query string (e.g. ?beta=true) from the original request
     qs = str(request.url.query) if request.url.query else ""
     if qs:
         upstream_url = f"{upstream_url}?{qs}"
+
+    unredactor = Unredactor(_global_cache)
 
     # NOTE: Do NOT use `async with` — the client must stay alive for the
     # lifetime of the StreamingResponse.  Closing it early causes httpx.ReadError.
@@ -224,7 +229,12 @@ async def _forward_raw(request: Request, body: dict, timeout: float) -> Streamin
 
         async def _raw_stream():
             try:
-                async for chunk in resp.aiter_bytes():
+                stream_src = (
+                    resp.aiter_bytes()
+                    if _no_unredact
+                    else unredact_stream(resp, unredactor)
+                )
+                async for chunk in stream_src:
                     yield chunk
             finally:
                 await resp.aclose()
@@ -234,12 +244,17 @@ async def _forward_raw(request: Request, body: dict, timeout: float) -> Streamin
     else:
         resp = await client.post(upstream_url, headers=headers,
                                  content=json.dumps(body).encode())
-        return JSONResponse(resp.json(), status_code=resp.status_code)
+        response_body = resp.json()
+        try:
+            response_body = unredact_response_body(response_body, unredactor)
+        except Exception:
+            logger.exception("Un-redaction failed in _forward_raw — passing through as-is")
+        return JSONResponse(response_body, status_code=resp.status_code)
 
 
 async def health(request: Request) -> JSONResponse:
     """Health check endpoint."""
-    return JSONResponse({"status": "ok", "projects": len(_caches)})
+    return JSONResponse({"status": "ok", "mappings": _global_cache.stats()["mappings"]})
 
 
 async def hello(request: Request) -> JSONResponse:
