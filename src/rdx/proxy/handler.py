@@ -90,6 +90,9 @@ def unredact_response_body(body: dict[str, Any], unredactor: Unredactor) -> dict
         block_type = block.get("type")
         if block_type == "text":
             content_blocks[i]["text"] = unredactor.unredact(block["text"])
+        elif block_type == "thinking":
+            if "thinking" in block:
+                content_blocks[i]["thinking"] = unredactor.unredact(block["thinking"])
         elif block_type == "tool_use":
             if "input" in block:
                 content_blocks[i]["input"] = _unredact_value(block["input"], unredactor)

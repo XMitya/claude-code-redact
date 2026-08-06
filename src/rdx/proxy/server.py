@@ -325,7 +325,12 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
 
             async def _raw_passthrough_stream():
                 try:
-                    async for chunk in upstream_resp.aiter_bytes():
+                    stream_src = (
+                        upstream_resp.aiter_bytes()
+                        if _no_unredact
+                        else unredact_stream(upstream_resp, unredactor)
+                    )
+                    async for chunk in stream_src:
                         yield chunk
                 finally:
                     await upstream_resp.aclose()
@@ -341,7 +346,14 @@ async def proxy_messages(request: Request) -> StreamingResponse | JSONResponse:
                     error_json = {"error": upstream_resp.text}
                 print(f"[rdx] req#{req_id} upstream {upstream_resp.status_code}: {error_json}", file=sys.stderr)
                 return JSONResponse(error_json, status_code=upstream_resp.status_code)
-            return JSONResponse(upstream_resp.json(), status_code=upstream_resp.status_code)
+            # Even with 0 mappings, response may contain tokens from
+            # prior requests in the same session (same cache).
+            response_body = upstream_resp.json()
+            try:
+                response_body = unredact_response_body(response_body, unredactor)
+            except Exception:
+                logger.exception("Un-redaction failed on 0-mappings response — passing through as-is")
+            return JSONResponse(response_body, status_code=upstream_resp.status_code)
 
     # Log outgoing redactions (only when audit enabled)
     if _audit_enabled:
