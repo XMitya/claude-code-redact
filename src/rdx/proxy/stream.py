@@ -189,9 +189,15 @@ async def unredact_stream(
 
         msg_type = data.get("type", "")
 
-        # Diagnostic: log raw data containing __rdx or __RDX
-        if "__rdx" in raw_data.lower():
-            print(f"[rdx][unredact] {msg_type} delta contains token: {raw_data[:300]}", file=sys.stderr)
+        # Diagnostic: log if reverse_map is non-empty and this data contains
+        # any known replacement (either __RDX_ token or format-preserving)
+        reverse_map = unredactor.cache.get_reverse_map()
+        if reverse_map:
+            lower_data = raw_data.lower()
+            for replacement in reverse_map:
+                if replacement.lower() in lower_data:
+                    print(f"[rdx][unredact] {msg_type} contains replacement '{replacement[:30]}': {raw_data[:200]}", file=sys.stderr)
+                    break
 
         if msg_type == "content_block_delta":
             delta = data.get("delta", {})
@@ -204,7 +210,11 @@ async def unredact_stream(
                     # Empty text delta — pass through as-is
                     yield _format_sse(event_type, json.dumps(data))
                     continue
-                emitted = text_buffer.feed(original_text)
+                # First unredact format-preserving replacements (whole words)
+                unredacted = unredactor.unredact(original_text)
+                # Then feed through buffer for __RDX_ tokens that may be
+                # split across deltas
+                emitted = text_buffer.feed(unredacted)
                 if emitted:
                     delta["text"] = emitted
                     data["delta"] = delta
@@ -216,7 +226,8 @@ async def unredact_stream(
                 if not original_text:
                     yield _format_sse(event_type, json.dumps(data))
                     continue
-                emitted = thinking_buffer.feed(original_text)
+                unredacted = unredactor.unredact(original_text)
+                emitted = thinking_buffer.feed(unredacted)
                 if emitted:
                     delta["thinking"] = emitted
                     data["delta"] = delta
