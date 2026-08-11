@@ -223,9 +223,11 @@ def handle_user_prompt_submit(data: dict[str, Any], project_dir: Path | None = N
         return 0
 
     # Check if the prompt contains any original (un-redacted) values
-    reverse_map = _cache.get_reverse_map()
-    if reverse_map:
-        originals = set(reverse_map.values())
+    # Use get_all_originals() — not get_reverse_map().values() — because
+    # multiple originals may share one replacement (e.g. RUSTORE and РУСТОР
+    # both map to AppStore) and ALL of them must be detected here.
+    originals = _cache.get_all_originals()
+    if originals:
         for original in originals:
             if original in prompt:
                 json.dump(
