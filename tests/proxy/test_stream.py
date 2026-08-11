@@ -228,27 +228,32 @@ class TestUnredactStream:
 
     @pytest.mark.asyncio
     async def test_tool_use_input_delta(self):
-        _, unredactor, cache = _setup()
+        _, unredactor, cache = _setup("sk-ant-abcdefghij")
         token = _get_token(cache, "sk-ant-abcdefghij")
         input_json = json.dumps({"file": "config.txt", "key": token})
 
         lines = [
             "event: content_block_delta",
-            f'data: {{"type":"content_block_delta","index":1,"delta":{{"type":"input_json_delta","partial_json":"{input_json[:20]}"}}}}',
+            "data: " + json.dumps({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": input_json[:20]}}),
             "event: content_block_delta",
-            f'data: {{"type":"content_block_delta","index":1,"delta":{{"type":"input_json_delta","partial_json":"{input_json[20:]}"}}}}',
+            "data: " + json.dumps({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": input_json[20:]}}),
             "event: content_block_stop",
-            'data: {"type":"content_block_stop","index":1}',
+            "data: " + json.dumps({"type": "content_block_stop", "index": 1}),
         ]
         resp = _FakeResponse(lines)
         chunks = []
         async for chunk in unredact_stream(resp, unredactor):
             chunks.append(chunk.decode())
 
-        # The input_json_delta events are passed through as-is
-        # (un-redaction happens at block stop for tool use internally)
+        # The input_json_delta events should NOT be passed through as-is.
+        # Instead, the complete unredacted JSON should be emitted as a single
+        # input_json_delta at content_block_stop.
         combined = "".join(chunks)
-        assert "content_block_delta" in combined
+        # The redaction token should be replaced with the original secret
+        assert "__rdx_key_" not in combined.lower(), f"Redaction token still present: {combined}"
+        assert "__RDX_" not in combined, f"Redaction token still present: {combined}"
+        # The unredacted JSON should be emitted as a single input_json_delta
+        assert "input_json_delta" in combined, "No input_json_delta emitted at block stop"
 
     @pytest.mark.asyncio
     async def test_ping_passthrough(self):

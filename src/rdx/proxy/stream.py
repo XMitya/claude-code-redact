@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+import sys
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -13,8 +15,11 @@ from rdx.core.unredactor import Unredactor
 # Maximum buffer size before flushing as-is (not a redaction token).
 _MAX_BUFFER = 512
 
-# Prefix that marks the start of a redaction token.
-_TOKEN_PREFIX = "__RDX_"
+# Regex to find start of a redaction token: __RDX_ or __rdx_ (case-insensitive)
+# followed by CATEGORY_ and hex hash, ending with __
+_TOKEN_RE = re.compile(r"__rdx_\w+_[0-9a-f]{8}__", re.IGNORECASE)
+# Prefix that marks the start of a redaction token (any case)
+_TOKEN_PREFIXES = ("__RDX_", "__rdx_")
 _TOKEN_SUFFIX = "__"
 
 
@@ -37,9 +42,10 @@ def _format_sse(event: str, data: str) -> bytes:
 class TextDeltaBuffer:
     """Buffers text_delta tokens to handle redaction tokens split across events.
 
-    When we encounter `__RDX_` we start buffering. We keep buffering until we
-    see the closing `__` or the buffer exceeds `_MAX_BUFFER` (in which case
-    the text is flushed as-is — it was not actually a token).
+    When we encounter `__RDX_` (or lowercase `__rdx_`) we start buffering.
+    We keep buffering until we see the closing `__` or the buffer exceeds
+    `_MAX_BUFFER` (in which case the text is flushed as-is — it was not
+    actually a token).
     """
 
     def __init__(self, unredactor: Unredactor) -> None:
@@ -57,17 +63,23 @@ class TextDeltaBuffer:
         self._buffer = ""
         return out
 
+    def _find_token_prefix(self, text: str) -> int:
+        """Find the earliest occurrence of any token prefix (case-insensitive)."""
+        lower_text = text.lower()
+        positions = [lower_text.find(p.lower()) for p in _TOKEN_PREFIXES]
+        positions = [p for p in positions if p != -1]
+        return min(positions) if positions else -1
+
     def _flush(self) -> str:
         """Emit as much completed text as possible from the buffer."""
         output_parts: list[str] = []
 
         while self._buffer:
-            prefix_pos = self._buffer.find(_TOKEN_PREFIX)
+            prefix_pos = self._find_token_prefix(self._buffer)
 
             if prefix_pos == -1:
                 # No token prefix in buffer.
                 # But the tail might be a partial prefix, so keep it buffered.
-                # E.g. buffer ends with "__RD" — that could become "__RDX_..."
                 keep = self._partial_prefix_length()
                 if keep > 0:
                     output_parts.append(self._buffer[:-keep])
@@ -82,9 +94,10 @@ class TextDeltaBuffer:
                 output_parts.append(self._buffer[:prefix_pos])
                 self._buffer = self._buffer[prefix_pos:]
 
-            # Buffer starts with __RDX_ — look for closing __
-            # Search for __ after the prefix (skip the prefix itself)
-            suffix_search_start = len(_TOKEN_PREFIX)
+            # Buffer starts with a token prefix — look for closing __
+            # Determine which prefix matched
+            matched_prefix = next(p for p in _TOKEN_PREFIXES if self._buffer.startswith(p))
+            suffix_search_start = len(matched_prefix)
             suffix_pos = self._buffer.find(_TOKEN_SUFFIX, suffix_search_start)
 
             if suffix_pos != -1:
@@ -104,13 +117,16 @@ class TextDeltaBuffer:
         return "".join(output_parts)
 
     def _partial_prefix_length(self) -> int:
-        """Check if the buffer ends with a partial `__RDX_` prefix.
+        """Check if the buffer ends with a partial token prefix.
 
         Returns the length of the trailing partial match (0 if none).
         """
-        for length in range(min(len(self._buffer), len(_TOKEN_PREFIX)), 0, -1):
-            if _TOKEN_PREFIX[:length] == self._buffer[-length:]:
-                return length
+        max_len = max(len(p) for p in _TOKEN_PREFIXES)
+        lower_buffer = self._buffer.lower()
+        for length in range(min(len(self._buffer), max_len), 0, -1):
+            for prefix in _TOKEN_PREFIXES:
+                if length <= len(prefix) and prefix.lower()[:length] == lower_buffer[-length:]:
+                    return length
         return 0
 
 
@@ -146,6 +162,7 @@ async def unredact_stream(
 ) -> AsyncGenerator[bytes, None]:
     """Process SSE stream from Anthropic, un-redact text content, yield events."""
     text_buffer = TextDeltaBuffer(unredactor)
+    thinking_buffer = TextDeltaBuffer(unredactor)
     tool_buffer = ToolUseBuffer()
     event_type = "message"  # Default if data arrives before an event line
 
@@ -172,6 +189,16 @@ async def unredact_stream(
 
         msg_type = data.get("type", "")
 
+        # Diagnostic: log if reverse_map is non-empty and this data contains
+        # any known replacement (either __RDX_ token or format-preserving)
+        reverse_map = unredactor.cache.get_reverse_map()
+        if reverse_map:
+            lower_data = raw_data.lower()
+            for replacement in reverse_map:
+                if replacement.lower() in lower_data:
+                    print(f"[rdx][unredact] {msg_type} contains replacement '{replacement[:30]}': {raw_data[:200]}", file=sys.stderr)
+                    break
+
         if msg_type == "content_block_delta":
             delta = data.get("delta", {})
             delta_type = delta.get("type", "")
@@ -183,17 +210,34 @@ async def unredact_stream(
                     # Empty text delta — pass through as-is
                     yield _format_sse(event_type, json.dumps(data))
                     continue
-                emitted = text_buffer.feed(original_text)
+                # First unredact format-preserving replacements (whole words)
+                unredacted = unredactor.unredact(original_text)
+                # Then feed through buffer for __RDX_ tokens that may be
+                # split across deltas
+                emitted = text_buffer.feed(unredacted)
                 if emitted:
                     delta["text"] = emitted
                     data["delta"] = delta
                     yield _format_sse(event_type, json.dumps(data))
                 continue
 
+            if delta_type == "thinking_delta":
+                original_text = delta.get("thinking", "")
+                if not original_text:
+                    yield _format_sse(event_type, json.dumps(data))
+                    continue
+                unredacted = unredactor.unredact(original_text)
+                emitted = thinking_buffer.feed(unredacted)
+                if emitted:
+                    delta["thinking"] = emitted
+                    data["delta"] = delta
+                    yield _format_sse(event_type, json.dumps(data))
+                continue
+
             if delta_type == "input_json_delta":
                 tool_buffer.feed(index, delta.get("partial_json", ""))
-                # Pass through the original delta — we'll fix up at block stop.
-                yield _format_sse(event_type, json.dumps(data))
+                # Buffer — don't yield yet. We'll emit the complete
+                # unredacted JSON at content_block_stop.
                 continue
 
         if msg_type == "content_block_stop":
@@ -208,11 +252,25 @@ async def unredact_stream(
                 }
                 yield _format_sse("content_block_delta", json.dumps(text_delta_event))
 
-            # We don't rewrite tool_use JSON at block stop in the stream —
-            # tool input was already passed through as deltas above.
-            # The un-redaction for tool_use happens at the client level
-            # when the complete tool input is assembled.
-            tool_buffer.flush(index, unredactor)
+            # Flush any remaining thinking text
+            remaining_thinking = thinking_buffer.flush_remaining()
+            if remaining_thinking:
+                thinking_delta_event = {
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "thinking_delta", "thinking": remaining_thinking},
+                }
+                yield _format_sse("content_block_delta", json.dumps(thinking_delta_event))
+
+            # Emit unredacted tool_use JSON as a single input_json_delta
+            unredacted_json = tool_buffer.flush(index, unredactor)
+            if unredacted_json is not None:
+                tool_delta_event = {
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "input_json_delta", "partial_json": unredacted_json},
+                }
+                yield _format_sse("content_block_delta", json.dumps(tool_delta_event))
 
         # Pass through the event as-is (message_start, message_delta,
         # message_stop, ping, content_block_start, content_block_stop, etc.)

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import json
+import sys
 from typing import Any
 
 from rdx.core.redactor import Redactor
@@ -83,6 +85,11 @@ def _unredact_value(value: Any, unredactor: Unredactor) -> Any:
 
 def unredact_response_body(body: dict[str, Any], unredactor: Unredactor) -> dict[str, Any]:
     """Walk the Messages API response body and un-redact all text content."""
+    body_str = json.dumps(body, default=str) if isinstance(body, dict) else str(body)
+    if "__rdx" in body_str.lower():
+        reverse_map = unredactor.cache.get_reverse_map()
+        print(f"[rdx][unredact] non-streaming response has tokens. Cache has {len(reverse_map)} entries: {list(reverse_map.keys())[:5]}", file=sys.stderr)
+
     body = copy.deepcopy(body)
 
     content_blocks = body.get("content", [])
@@ -90,6 +97,9 @@ def unredact_response_body(body: dict[str, Any], unredactor: Unredactor) -> dict
         block_type = block.get("type")
         if block_type == "text":
             content_blocks[i]["text"] = unredactor.unredact(block["text"])
+        elif block_type == "thinking":
+            if "thinking" in block:
+                content_blocks[i]["thinking"] = unredactor.unredact(block["thinking"])
         elif block_type == "tool_use":
             if "input" in block:
                 content_blocks[i]["input"] = _unredact_value(block["input"], unredactor)
