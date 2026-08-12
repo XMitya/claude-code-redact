@@ -115,6 +115,72 @@ class TestTextDeltaBuffer:
         assert "__RDX_" not in combined
 
 
+class TestFormatPreservingSplit:
+    """Format-preserving replacements (e.g. AppStore) split across deltas."""
+
+    def _setup_replacement(self) -> tuple[Unredactor, MappingCache]:
+        cache = MappingCache()
+        cache.get_or_create("rustore", "RUSTORE", "PROJECT", "AppStore")
+        return Unredactor(cache), cache
+
+    def test_replacement_split_across_feeds(self):
+        """AppStore split as 'App' + 'Store' should unredact to RUSTORE."""
+        unredactor, _ = self._setup_replacement()
+        buf = TextDeltaBuffer(unredactor)
+        result = ""
+        for d in ["The ", "App", "Store", " project"]:
+            unredacted = unredactor.unredact(d)
+            result += buf.feed(unredacted)
+        result += buf.flush_remaining()
+        assert "RUSTORE" in result
+        assert "AppStore" not in result
+
+    def test_replacement_single_feed(self):
+        """AppStore in a single delta should unredact to RUSTORE."""
+        unredactor, _ = self._setup_replacement()
+        buf = TextDeltaBuffer(unredactor)
+        result = ""
+        for d in ["The ", "AppStore", " project"]:
+            unredacted = unredactor.unredact(d)
+            result += buf.feed(unredacted)
+        result += buf.flush_remaining()
+        assert "RUSTORE" in result
+
+    def test_lowercase_replacement_split(self):
+        """Lowercase 'appstore' split as 'app' + 'store' -> 'rustore'."""
+        unredactor, _ = self._setup_replacement()
+        buf = TextDeltaBuffer(unredactor)
+        result = ""
+        for d in ["use ", "app", "store", " for builds"]:
+            unredacted = unredactor.unredact(d)
+            result += buf.feed(unredacted)
+        result += buf.flush_remaining()
+        assert "rustore" in result
+
+    def test_false_positive_not_replacement(self):
+        """Text that starts like replacement but isn't should pass through."""
+        unredactor, _ = self._setup_replacement()
+        buf = TextDeltaBuffer(unredactor)
+        result = ""
+        for d in ["Application ", "store ", "data"]:
+            unredacted = unredactor.unredact(d)
+            result += buf.feed(unredacted)
+        result += buf.flush_remaining()
+        assert "Application" in result
+        assert "AppStore" not in result
+
+    def test_normal_text_unaffected(self):
+        """Text without replacements should pass through unchanged."""
+        unredactor, _ = self._setup_replacement()
+        buf = TextDeltaBuffer(unredactor)
+        result = ""
+        for d in ["Hello ", "world ", "test"]:
+            unredacted = unredactor.unredact(d)
+            result += buf.feed(unredacted)
+        result += buf.flush_remaining()
+        assert result == "Hello world test"
+
+
 class TestToolUseBuffer:
     def test_accumulate_and_flush(self):
         _, unredactor, cache = _setup()
