@@ -4,6 +4,15 @@ from __future__ import annotations
 
 from .mappings import MappingCache
 
+# Prefixes for auto-generated tokens — these have a fixed format and
+# _match_case should NOT be applied to them (the original is stored as-is).
+_TOKEN_PREFIXES = ("__rdx_",)
+
+
+def _is_token(replacement: str) -> bool:
+    """Return True if replacement is an auto-generated __RDX_ token."""
+    return replacement.lower().startswith(_TOKEN_PREFIXES)
+
 
 def _match_case(template: str, text: str) -> str:
     """Adjust text to match the case style of template.
@@ -22,6 +31,59 @@ def _match_case(template: str, text: str) -> str:
     return text
 
 
+def _is_cyrillic(text: str) -> bool:
+    """Return True if text contains at least one Cyrillic character."""
+    for ch in text:
+        if '\u0400' <= ch <= '\u04ff':  # Cyrillic and Cyrillic Supplement
+            return True
+    return False
+
+
+def _is_latin(text: str) -> bool:
+    """Return True if text contains at least one Latin letter."""
+    for ch in text:
+        if ch.isalpha() and ch.isascii():
+            return True
+    return False
+
+
+def _pick_original_by_context(
+    originals: list[str],
+    left_ctx: str,
+    right_ctx: str,
+) -> str:
+    """Pick the best original from multiple candidates based on surrounding text.
+
+    When a format-preserving replacement (e.g. ``AppStore``) is shared by
+    multiple originals (e.g. ``RUSTORE`` in Latin and ``РУСТОР`` in Cyrillic),
+    we look at the characters immediately before and after the replacement
+    in the text to determine the script of the surrounding content, then
+    pick the original that matches that script.
+
+    If context is ambiguous or neutral (digits, punctuation only), fall back
+    to Latin-preferred (the default from _pick_best_original).
+    """
+    ctx = left_ctx + right_ctx
+    ctx_cyrillic = _is_cyrillic(ctx)
+    ctx_latin = _is_latin(ctx)
+
+    # If surrounding text is Cyrillic, prefer a Cyrillic original
+    if ctx_cyrillic and not ctx_latin:
+        for orig in originals:
+            if _is_cyrillic(orig):
+                return orig
+    # If surrounding text is Latin, prefer a Latin original
+    if ctx_latin and not ctx_cyrillic:
+        for orig in originals:
+            if _is_latin(orig) and not _is_cyrillic(orig):
+                return orig
+    # Ambiguous or neutral context — prefer Latin (default)
+    for orig in originals:
+        if orig.isascii():
+            return orig
+    return originals[0]
+
+
 class Unredactor:
     """Reverses redactions using the in-memory mapping cache."""
 
@@ -30,33 +92,49 @@ class Unredactor:
 
     def unredact(self, text: str) -> str:
         """Replace all redaction tokens / replacements with original values."""
-        reverse_map = self.cache.get_reverse_map()
-        if not reverse_map:
+        reverse_map_all = self.cache.get_reverse_map_all()
+        if not reverse_map_all:
             return text
 
-        # Build a case-insensitive lookup: lowercase token -> original
+        # Build a case-insensitive lookup: lowercase replacement -> (originals, raw_replacement)
         # This handles _match_case() in redactor.py which may change the
         # token case (e.g. __RDX_KEY_abc123__ -> __rdx_key_abc123__).
-        ci_map = {k.lower(): v for k, v in reverse_map.items()}
+        ci_map: dict[str, tuple[list[str], str]] = {
+            k.lower(): (v, k) for k, v in reverse_map_all.items()
+        }
 
-        # Sort by token length (longest first) to avoid partial-match
-        # corruption — e.g. replacing "__rdx_name_" before "__rdx_name_a1b2__".
+        # Sort by replacement length (longest first) to avoid partial-match
+        # corruption — e.g. replacing "AppSto" before "AppStore".
         result = text
-        for ci_token, original in sorted(
+        for ci_token, (originals, raw_replacement) in sorted(
             ci_map.items(), key=lambda x: -len(x[0])
         ):
-            # Case-insensitive replace, preserving the case style of the
-            # replacement found in text (reverse of _match_case in redactor).
+            is_token = _is_token(raw_replacement)
             lower_result = result.lower()
-            lower_token = ci_token
             while True:
-                pos = lower_result.find(lower_token)
+                pos = lower_result.find(ci_token)
                 if pos == -1:
                     break
-                # Extract the actual replacement text from the result
                 found = result[pos:pos + len(ci_token)]
-                # Match the case style of 'found' to the original
-                restored = _match_case(found, original)
+
+                if len(originals) == 1:
+                    original = originals[0]
+                else:
+                    # Multiple originals share this replacement — pick by context
+                    left_ctx = result[max(0, pos - 40):pos]
+                    right_ctx = result[pos + len(ci_token):pos + len(ci_token) + 40]
+                    original = _pick_original_by_context(originals, left_ctx, right_ctx)
+
+                # For __RDX_ tokens, _match_case produces wrong results because
+                # "__RDX_A__".isupper() is True (underscores are not cased),
+                # which would turn "bob" into "BOB". The original is already
+                # stored in its correct case — return as-is.
+                if is_token:
+                    restored = original
+                else:
+                    # Format-preserving replacement: match case of found text
+                    restored = _match_case(found, original)
+
                 result = result[:pos] + restored + result[pos + len(ci_token):]
                 lower_result = result.lower()
 

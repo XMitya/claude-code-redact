@@ -42,10 +42,16 @@ def _format_sse(event: str, data: str) -> bytes:
 class TextDeltaBuffer:
     """Buffers text_delta tokens to handle redaction tokens split across events.
 
-    When we encounter `__RDX_` (or lowercase `__rdx_`) we start buffering.
-    We keep buffering until we see the closing `__` or the buffer exceeds
-    `_MAX_BUFFER` (in which case the text is flushed as-is — it was not
-    actually a token).
+    Handles two kinds of redaction markers that may be split across
+    streaming deltas:
+
+    1. Auto-generated tokens: ``__RDX_CATEGORY_hash__`` (or lowercase).
+       Buffered from the ``__RDX_`` prefix until the closing ``__``.
+
+    2. Format-preserving replacements (e.g. ``AppStore``): plain words
+       that may be split across deltas (e.g. ``App`` + ``Store``).
+       The buffer keeps a tail that could be the start of a known
+       replacement, so the next delta can complete it.
     """
 
     def __init__(self, unredactor: Unredactor) -> None:
@@ -78,20 +84,36 @@ class TextDeltaBuffer:
             prefix_pos = self._find_token_prefix(self._buffer)
 
             if prefix_pos == -1:
-                # No token prefix in buffer.
-                # But the tail might be a partial prefix, so keep it buffered.
-                keep = self._partial_prefix_length()
+                # No __RDX_ token prefix in buffer.
+                # Check for format-preserving replacements that may be
+                # split across deltas (e.g. "App" + "Store" = "AppStore").
+                keep = self._partial_replacement_length()
                 if keep > 0:
-                    output_parts.append(self._buffer[:-keep])
+                    # The tail might be the start of a replacement word.
+                    # But first, unredact and emit everything before it.
+                    emit_part = self._buffer[:-keep]
+                    if emit_part:
+                        output_parts.append(self.unredactor.unredact(emit_part))
                     self._buffer = self._buffer[-keep:]
+                    # Also check __RDX_ partial prefix
+                    rdx_keep = self._partial_prefix_length()
+                    if rdx_keep > 0 and rdx_keep < len(self._buffer):
+                        output_parts.append(self.unredactor.unredact(self._buffer[:-rdx_keep]))
+                        self._buffer = self._buffer[-rdx_keep:]
                 else:
-                    output_parts.append(self._buffer)
-                    self._buffer = ""
+                    # Check for partial __RDX_ prefix
+                    rdx_keep = self._partial_prefix_length()
+                    if rdx_keep > 0:
+                        output_parts.append(self.unredactor.unredact(self._buffer[:-rdx_keep]))
+                        self._buffer = self._buffer[-rdx_keep:]
+                    else:
+                        output_parts.append(self.unredactor.unredact(self._buffer))
+                        self._buffer = ""
                 break
 
             if prefix_pos > 0:
                 # Emit everything before the prefix.
-                output_parts.append(self._buffer[:prefix_pos])
+                output_parts.append(self.unredactor.unredact(self._buffer[:prefix_pos]))
                 self._buffer = self._buffer[prefix_pos:]
 
             # Buffer starts with a token prefix — look for closing __
@@ -117,7 +139,7 @@ class TextDeltaBuffer:
         return "".join(output_parts)
 
     def _partial_prefix_length(self) -> int:
-        """Check if the buffer ends with a partial token prefix.
+        """Check if the buffer ends with a partial __RDX_ token prefix.
 
         Returns the length of the trailing partial match (0 if none).
         """
@@ -128,6 +150,35 @@ class TextDeltaBuffer:
                 if length <= len(prefix) and prefix.lower()[:length] == lower_buffer[-length:]:
                     return length
         return 0
+
+    def _partial_replacement_length(self) -> int:
+        """Check if the buffer ends with a partial format-preserving replacement.
+
+        Returns the length of the trailing partial match (0 if none).
+        Only considers non-token replacements (e.g. ``AppStore``), not
+        ``__RDX_`` tokens (those are handled by _partial_prefix_length).
+        """
+        reverse_map_all = self.unredactor.cache.get_reverse_map_all()
+        if not reverse_map_all:
+            return 0
+
+        lower_buffer = self._buffer.lower()
+        max_keep = 0
+
+        for replacement in reverse_map_all:
+            if replacement.lower().startswith(_TOKEN_PREFIXES):
+                continue  # __RDX_ tokens handled separately
+            r_lower = replacement.lower()
+            # Check if the buffer tail matches the start of this replacement.
+            # E.g. buffer ends with "app", replacement is "appstore" -> match length 3.
+            max_possible = min(len(self._buffer), len(r_lower) - 1)
+            for length in range(max_possible, 0, -1):
+                if r_lower[:length] == lower_buffer[-length:]:
+                    if length > max_keep:
+                        max_keep = length
+                    break
+
+        return max_keep
 
 
 class ToolUseBuffer:
