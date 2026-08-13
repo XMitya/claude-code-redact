@@ -116,58 +116,58 @@ class TestTextDeltaBuffer:
 
 
 class TestFormatPreservingSplit:
-    """Format-preserving replacements (e.g. AppStore) split across deltas."""
+    """Format-preserving replacements (e.g. Substitute) split across deltas."""
 
     def _setup_replacement(self) -> tuple[Unredactor, MappingCache]:
         cache = MappingCache()
-        cache.get_or_create("rustore", "RUSTORE", "PROJECT", "AppStore")
+        cache.get_or_create("proj-x", "projectx", "PROJECT", "substitute")
         return Unredactor(cache), cache
 
     def test_replacement_split_across_feeds(self):
-        """AppStore split as 'App' + 'Store' should unredact to RUSTORE."""
+        """substitute split as 'sub' + 'stitute' should unredact to projectx."""
         unredactor, _ = self._setup_replacement()
         buf = TextDeltaBuffer(unredactor)
         result = ""
-        for d in ["The ", "App", "Store", " project"]:
+        for d in ["The ", "sub", "stitute", " project"]:
             unredacted = unredactor.unredact(d)
             result += buf.feed(unredacted)
         result += buf.flush_remaining()
-        assert "RUSTORE" in result
-        assert "AppStore" not in result
+        assert "projectx" in result
+        assert "substitute" not in result
 
     def test_replacement_single_feed(self):
-        """AppStore in a single delta should unredact to RUSTORE."""
+        """substitute in a single delta should unredact to projectx."""
         unredactor, _ = self._setup_replacement()
         buf = TextDeltaBuffer(unredactor)
         result = ""
-        for d in ["The ", "AppStore", " project"]:
+        for d in ["The ", "substitute", " project"]:
             unredacted = unredactor.unredact(d)
             result += buf.feed(unredacted)
         result += buf.flush_remaining()
-        assert "RUSTORE" in result
+        assert "projectx" in result
 
     def test_lowercase_replacement_split(self):
-        """Lowercase 'appstore' split as 'app' + 'store' -> 'rustore'."""
+        """Lowercase 'substitute' split as 'sub' + 'stitute' -> 'projectx'."""
         unredactor, _ = self._setup_replacement()
         buf = TextDeltaBuffer(unredactor)
         result = ""
-        for d in ["use ", "app", "store", " for builds"]:
+        for d in ["use ", "sub", "stitute", " for builds"]:
             unredacted = unredactor.unredact(d)
             result += buf.feed(unredacted)
         result += buf.flush_remaining()
-        assert "rustore" in result
+        assert "projectx" in result
 
     def test_false_positive_not_replacement(self):
         """Text that starts like replacement but isn't should pass through."""
         unredactor, _ = self._setup_replacement()
         buf = TextDeltaBuffer(unredactor)
         result = ""
-        for d in ["Application ", "store ", "data"]:
+        for d in ["substitution ", "data", " here"]:
             unredacted = unredactor.unredact(d)
             result += buf.feed(unredacted)
         result += buf.flush_remaining()
-        assert "Application" in result
-        assert "AppStore" not in result
+        assert "substitution" in result
+        assert "substitute" not in result
 
     def test_normal_text_unaffected(self):
         """Text without replacements should pass through unchanged."""
