@@ -168,14 +168,29 @@ class TestRoundTrip:
         assert restored == original
 
 
-class TestContextAwareUnredaction:
+class TestSharedReplacementUnredaction:
     """When multiple originals share one format-preserving replacement,
-    the unredactor must pick the right one based on surrounding script."""
+    the unredactor must always pick the Latin original.
 
-    def test_latin_context_restores_latin_original(self) -> None:
-        """In Latin context, AppStore -> RUSTORE (not РУСТОР)."""
+    Format-preserving replacements (e.g. AppStore) are always Latin.
+    In code-editing contexts, the Latin original (e.g. RUSTORE) is the
+    one that matters — it appears in identifiers, ticket keys, URLs.
+    Restoring the Cyrillic variant (РУСТОР) corrupts file edits.
+    """
+
+    def test_always_latin_even_in_cyrillic_context(self) -> None:
+        """AppStore always -> RUSTORE, even in Cyrillic text."""
         cache = MappingCache()
-        # Same rule, same replacement, two originals
+        cache.get_or_create("rustore", "RUSTORE", "PROJECT", "AppStore")
+        cache.get_or_create("rustore", "РУСТОР", "PROJECT", "AppStore")
+        unredactor = Unredactor(cache)
+        result = unredactor.unredact("Проект AppStore готов к релизу")
+        assert "RUSTORE" in result
+        assert "РУСТОР" not in result
+
+    def test_always_latin_in_latin_context(self) -> None:
+        """AppStore -> RUSTORE in Latin context."""
+        cache = MappingCache()
         cache.get_or_create("rustore", "RUSTORE", "PROJECT", "AppStore")
         cache.get_or_create("rustore", "РУСТОР", "PROJECT", "AppStore")
         unredactor = Unredactor(cache)
@@ -183,71 +198,34 @@ class TestContextAwareUnredaction:
         assert "RUSTORE" in result
         assert "РУСТОР" not in result
 
-    def test_cyrillic_context_restores_cyrillic_original(self) -> None:
-        """In Cyrillic context, AppStore -> РУСТОР (not RUSTORE)."""
-        cache = MappingCache()
-        cache.get_or_create("rustore", "RUSTORE", "PROJECT", "AppStore")
-        cache.get_or_create("rustore", "РУСТОР", "PROJECT", "AppStore")
-        unredactor = Unredactor(cache)
-        result = unredactor.unredact("Проект AppStore готов к релизу")
-        assert "РУСТОР" in result
-        assert "RUSTORE" not in result
-
-    def test_lowercase_latin_context(self) -> None:
-        """Lowercase 'appstore' in Latin context -> 'rustore' (lowercase)."""
-        cache = MappingCache()
-        cache.get_or_create("rustore", "RUSTORE", "PROJECT", "AppStore")
-        cache.get_or_create("rustore", "РУСТОР", "PROJECT", "AppStore")
-        unredactor = Unredactor(cache)
-        result = unredactor.unredact("use appstore for builds")
-        assert "rustore" in result
-
-    def test_lowercase_cyrillic_context(self) -> None:
-        """Lowercase 'appstore' in Cyrillic context -> 'рустор' (lowercase)."""
+    def test_lowercase_always_latin(self) -> None:
+        """Lowercase 'appstore' -> 'rustore' (Latin), even in Cyrillic context."""
         cache = MappingCache()
         cache.get_or_create("rustore", "RUSTORE", "PROJECT", "AppStore")
         cache.get_or_create("rustore", "РУСТОР", "PROJECT", "AppStore")
         unredactor = Unredactor(cache)
         result = unredactor.unredact("используй appstore для сборки")
-        assert "рустор" in result
+        assert "rustore" in result
+        assert "рустор" not in result
 
-    def test_uppercase_in_latin_context(self) -> None:
-        """Uppercase APPSTORE in Latin context -> RUSTORE (uppercase)."""
-        cache = MappingCache()
-        cache.get_or_create("rustore", "RUSTORE", "PROJECT", "AppStore")
-        cache.get_or_create("rustore", "РУСТОР", "PROJECT", "AppStore")
-        unredactor = Unredactor(cache)
-        result = unredactor.unredact("THE APPSTORE IS READY")
-        assert "RUSTORE" in result
-
-    def test_uppercase_in_cyrillic_context(self) -> None:
-        """Uppercase APPSTORE in Cyrillic context -> РУСТОР (uppercase)."""
+    def test_uppercase_always_latin(self) -> None:
+        """Uppercase APPSTORE -> RUSTORE, even in Cyrillic context."""
         cache = MappingCache()
         cache.get_or_create("rustore", "RUSTORE", "PROJECT", "AppStore")
         cache.get_or_create("rustore", "РУСТОР", "PROJECT", "AppStore")
         unredactor = Unredactor(cache)
         result = unredactor.unredact("ПРОЕКТ APPSTORE ГОТОВ")
-        assert "РУСТОР" in result
+        assert "RUSTORE" in result
 
-    def test_mixed_context_both_scripts(self) -> None:
-        """When both scripts appear, each replacement picks its own original."""
+    def test_ticket_key_not_corrupted(self) -> None:
+        """APPSTORE-103217 -> RUSTORE-103217 (not РУСТОР-103217)."""
         cache = MappingCache()
         cache.get_or_create("rustore", "RUSTORE", "PROJECT", "AppStore")
         cache.get_or_create("rustore", "РУСТОР", "PROJECT", "AppStore")
         unredactor = Unredactor(cache)
-        result = unredactor.unredact("AppStore (AppStore) test")
-        # First AppStore in Latin context -> RUSTORE
-        # Second AppStore in mixed context -> falls back to Latin
-        assert "RUSTORE" in result
-
-    def test_neutral_context_defaults_to_latin(self) -> None:
-        """When context is digits/punctuation only, prefer Latin original."""
-        cache = MappingCache()
-        cache.get_or_create("rustore", "RUSTORE", "PROJECT", "AppStore")
-        cache.get_or_create("rustore", "РУСТОР", "PROJECT", "AppStore")
-        unredactor = Unredactor(cache)
-        result = unredactor.unredact("123 AppStore 456")
-        assert "RUSTORE" in result
+        result = unredactor.unredact("Посмотри тикет APPSTORE-103217")
+        assert "RUSTORE-103217" in result
+        assert "РУСТОР" not in result
 
     def test_round_trip_redact_unredact_latin(self) -> None:
         """Full round-trip: redact RUSTORE -> APPSTORE -> unredact back to RUSTORE."""
@@ -272,8 +250,13 @@ class TestContextAwareUnredaction:
         restored = unredactor.unredact(scan_result.redacted_text)
         assert restored == original
 
-    def test_round_trip_redact_unredact_cyrillic(self) -> None:
-        """Full round-trip: redact РУСТОР -> APPSTORE -> unredact back to РУСТОР."""
+    def test_round_trip_cyrillic_restores_latin_when_both_in_cache(self) -> None:
+        """When both RUSTORE and РУСТОР are in cache, unredact always picks RUSTORE.
+
+        Even if the redacted text was originally РУСТОР, the Latin original
+        is restored because it's the one used in code, identifiers, and
+        ticket keys. Restoring Cyrillic would corrupt file edits.
+        """
         cache = MappingCache()
         rule = Rule(
             id="rustore",
@@ -284,13 +267,14 @@ class TestContextAwareUnredaction:
             category="PROJECT",
         )
         redactor = Redactor([rule], cache)
-        original = "РУСТОР — отличный проект"
-        scan_result = redactor.redact(original)
+        # Redact both so both originals are in cache
+        redactor.redact("RUSTORE")
+        scan_result = redactor.redact("РУСТОР — отличный проект")
         assert scan_result.redacted_text is not None
         assert "РУСТОР" not in scan_result.redacted_text
-        # Redactor applies _match_case: РУСТОР is upper -> AppStore becomes APPSTORE
         assert "APPSTORE" in scan_result.redacted_text
 
         unredactor = Unredactor(cache)
         restored = unredactor.unredact(scan_result.redacted_text)
-        assert restored == original
+        # Latin original is restored, not Cyrillic
+        assert "RUSTORE" in restored

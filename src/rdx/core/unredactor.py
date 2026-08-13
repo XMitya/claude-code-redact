@@ -31,53 +31,15 @@ def _match_case(template: str, text: str) -> str:
     return text
 
 
-def _is_cyrillic(text: str) -> bool:
-    """Return True if text contains at least one Cyrillic character."""
-    for ch in text:
-        if '\u0400' <= ch <= '\u04ff':  # Cyrillic and Cyrillic Supplement
-            return True
-    return False
+def _pick_original(originals: list[str]) -> str:
+    """Pick the best original from multiple candidates sharing one replacement.
 
-
-def _is_latin(text: str) -> bool:
-    """Return True if text contains at least one Latin letter."""
-    for ch in text:
-        if ch.isalpha() and ch.isascii():
-            return True
-    return False
-
-
-def _pick_original_by_context(
-    originals: list[str],
-    left_ctx: str,
-    right_ctx: str,
-) -> str:
-    """Pick the best original from multiple candidates based on surrounding text.
-
-    When a format-preserving replacement (e.g. ``AppStore``) is shared by
-    multiple originals (e.g. ``RUSTORE`` in Latin and ``РУСТОР`` in Cyrillic),
-    we look at the characters immediately before and after the replacement
-    in the text to determine the script of the surrounding content, then
-    pick the original that matches that script.
-
-    If context is ambiguous or neutral (digits, punctuation only), fall back
-    to Latin-preferred (the default from _pick_best_original).
+    Always prefers Latin/ASCII originals. Format-preserving replacements
+    are always Latin (e.g. ``AppStore``), and in code-editing contexts the
+    Latin original (e.g. ``RUSTORE``) is the one that matters — it appears
+    in identifiers, ticket keys, URLs, etc. Restoring ``РУСТОР`` instead
+    of ``RUSTORE`` corrupts file edits.
     """
-    ctx = left_ctx + right_ctx
-    ctx_cyrillic = _is_cyrillic(ctx)
-    ctx_latin = _is_latin(ctx)
-
-    # If surrounding text is Cyrillic, prefer a Cyrillic original
-    if ctx_cyrillic and not ctx_latin:
-        for orig in originals:
-            if _is_cyrillic(orig):
-                return orig
-    # If surrounding text is Latin, prefer a Latin original
-    if ctx_latin and not ctx_cyrillic:
-        for orig in originals:
-            if _is_latin(orig) and not _is_cyrillic(orig):
-                return orig
-    # Ambiguous or neutral context — prefer Latin (default)
     for orig in originals:
         if orig.isascii():
             return orig
@@ -120,10 +82,9 @@ class Unredactor:
                 if len(originals) == 1:
                     original = originals[0]
                 else:
-                    # Multiple originals share this replacement — pick by context
-                    left_ctx = result[max(0, pos - 40):pos]
-                    right_ctx = result[pos + len(ci_token):pos + len(ci_token) + 40]
-                    original = _pick_original_by_context(originals, left_ctx, right_ctx)
+                    # Multiple originals share this replacement — always
+                    # prefer Latin (code-editing safety).
+                    original = _pick_original(originals)
 
                 # For __RDX_ tokens, _match_case produces wrong results because
                 # "__RDX_A__".isupper() is True (underscores are not cased),
