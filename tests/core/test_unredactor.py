@@ -277,3 +277,36 @@ class TestSharedReplacementUnredaction:
         restored = unredactor.unredact(scan_result.redacted_text)
         # Latin original is restored, not Cyrillic
         assert "projectx" in restored
+
+    def test_case_aware_pick_among_multiple_ascii_originals(self) -> None:
+        """When multiple ASCII originals share a replacement, pick by case style.
+
+        substitute (title) -> ProjectX (title)
+        SUBSTITUTE (upper) -> PROJECTX (upper)
+        substitute (lower) -> projectx (lower)
+        """
+        cache = MappingCache()
+        cache.get_or_create("proj-x", "ProjectX", "PROJECT", "Substitute")
+        cache.get_or_create("proj-x", "PROJECTX", "PROJECT", "Substitute")
+        cache.get_or_create("proj-x", "projectx", "PROJECT", "Substitute")
+        cache.get_or_create("proj-x", "замена", "PROJECT", "Substitute")
+        unredactor = Unredactor(cache)
+
+        assert unredactor.unredact("SubstituteInterceptor") == "ProjectXInterceptor"
+        assert unredactor.unredact("SUBSTITUTEInterceptor") == "PROJECTXInterceptor"
+        assert unredactor.unredact("substituteInterceptor") == "projectxInterceptor"
+
+    def test_case_aware_pick_prefers_title_for_mixed_case_identifier(self) -> None:
+        """When found text is title-case, restore title-case original.
+
+        This handles identifiers like SubstituteVerCodeHeaderInterceptor
+        where the replacement appears in title case within a CamelCase name.
+        """
+        cache = MappingCache()
+        cache.get_or_create("proj-x", "ProjectX", "PROJECT", "Substitute")
+        cache.get_or_create("proj-x", "PROJECTX", "PROJECT", "Substitute")
+        unredactor = Unredactor(cache)
+
+        result = unredactor.unredact("SubstituteVerCodeHeaderInterceptor")
+        assert "ProjectX" in result
+        assert "PROJECTX" not in result
